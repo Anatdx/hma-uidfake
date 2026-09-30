@@ -185,9 +185,18 @@ void test_preset_cache()
 	facts = {};
 	check(uidfake::load_preset_cache(config, facts).empty(), true,
 	      "cache: absent keys");
+	/* A v2 caught half-written must not cost the device the presets the older
+	 * file still carries: the other name is read instead. */
 	write_config("preset_cache_test/preset_cache_v2.json", "{invalid");
-	check(uidfake::load_preset_cache(config, facts).empty(), true,
-	      "cache: malformed JSON");
+	auto fallback = uidfake::load_preset_cache(config, facts);
+	check(fallback.contains("legacy") &&
+		      fallback.at("legacy").contains("com.example.legacy"),
+	      true, "cache: a malformed v2 falls back to the older file");
+	/* With nothing readable left there are no presets to apply, and that is what
+	 * the caller has to see. */
+	std::filesystem::remove(old_cache);
+	fallback = uidfake::load_preset_cache(config, facts);
+	check(fallback.empty(), true, "cache: nothing readable is no presets");
 	std::filesystem::remove(new_cache);
 	std::filesystem::remove(old_cache);
 	std::filesystem::remove(config);

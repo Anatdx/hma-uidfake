@@ -151,20 +151,29 @@ Presets load_preset_cache(const std::filesystem::path &config_file,
                           PresetFacts &facts) {
   Presets presets;
   std::error_code ignored;
-  auto cache = config_file.parent_path() / kPresetCacheNew;
-  if (!std::filesystem::exists(cache, ignored))
-    cache = config_file.parent_path() / kPresetCacheOld;
 
+  /* The new name is what the app writes now and wins when it reads, but a file
+   * caught half-written, or one a writer trimmed, must not cost the device its
+   * presets: the other name is read instead. */
   nlohmann::json json;
-  try {
-    std::ifstream in{cache};
-    if (!in)
-      return presets;
-    in >> json;
-  } catch (const std::exception &e) {
-    Log::warn("cannot parse {}: {}", cache.string(), e.what());
-    return presets;
+  bool have_cache = false;
+  for (const auto &cache : {config_file.parent_path() / kPresetCacheNew,
+                            config_file.parent_path() / kPresetCacheOld}) {
+    if (!std::filesystem::exists(cache, ignored))
+      continue;
+    try {
+      std::ifstream in{cache};
+      if (!in)
+        continue;
+      in >> json;
+      have_cache = true;
+      break;
+    } catch (const std::exception &e) {
+      Log::warn("cannot parse {}: {}", cache.string(), e.what());
+    }
   }
+  if (!have_cache)
+    return presets;
 
   // items() is a proxy into its JSON owner. Keep that owner alive for the loop,
   // including with NDK r27's compiler, which does not extend its lifetime here.

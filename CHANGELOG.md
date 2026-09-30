@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.3
+
+- The tool reads the package database whichever form it is written in. Android 12 introduced the
+  binary one (ABX) and `Xml.resolveSerializer()` picks between the two by the system property
+  `persist.sys.binary_xml`, while reading sniffs the header -- so a device can carry either, and a
+  device whose database is text used to get no rules at all, which is nothing hidden for anyone. One
+  entry header hands out the same events for both forms, the readers live in their own units, and a
+  file that is neither form is refused with the first bytes in the log rather than guessed at. Two
+  things the text form needed besides a parser: the system flag, which that writer spells
+  `publicFlags` where the binary one writes `flags`, and the shared user id, which was never read
+  from a `<shared-user>` element at all.
+
+- The manager hides itself under the xposed preset again. HMA-OSS writes itself into that preset in
+  code and exports only the scanned half to its cache, and the generated table of written-in names
+  had xposed empty: the generator collected quoted strings only, so the bare
+  `BuildConfig.APP_PACKAGE_NAME` was dropped without a word. On a device that has run the app, where
+  the cache answers, every caller that applies the preset saw the manager, while a scan of the same
+  packages hid it. The generator resolves that name from the app's build script now and refuses to
+  write a table at all when it meets an identifier it cannot resolve.
+
+- A preset cache that cannot be parsed falls back to the older file instead of leaving the device
+  with no presets and a full rescan of every installed apk, and a package that joins a shared user
+  gets its app id back.
+
 ## 0.3.2
 
 - A kernel where the setuid hook cannot be taken still learns who changes ids: the setters in both

@@ -12,3 +12,4 @@ dist/
 # Scratch space for local analysis; nothing here belongs in a commit.
 .scratch/
 /build*/
+.pi

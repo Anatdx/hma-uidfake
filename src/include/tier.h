@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #pragma once
 
-#ifdef __KERNEL__
+/* The host test compiles the framework itself, so it needs the definitions too. */
+#if defined(__KERNEL__) || defined(UIDFAKE_HOST_TEST)
 
 /*
  * tier.h - the fallback chains, as a registry.

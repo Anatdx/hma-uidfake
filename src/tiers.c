@@ -7,7 +7,11 @@
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
+#ifdef UIDFAKE_HOST_TEST
+#include <string.h> /* the host test compiles this file against its own shims */
+#else
 #include <linux/string.h>
+#endif
 
 #include "uidfake.h"
 #include "tier.h"
@@ -19,15 +23,54 @@ extern const struct uf_tier uf_tier_setuid_inline;
 extern const struct uf_tier uf_tier_setuid_lsm;
 extern const struct uf_tier uf_tier_setuid_setters;
 
+#ifdef UIDFAKE_HOST_TEST
+/*
+ * The host test supplies its own mechanisms. The kernel's table is fixed, so
+ * this is compiled in only for the test, and the two accessors below are the
+ * only place the choice shows.
+ */
+static const struct uf_tier *const *g_test_tiers;
+static unsigned int g_test_tiers_n;
+
+void uf_tier_set_table(const struct uf_tier *const *tiers, unsigned int n)
+{
+	g_test_tiers = tiers;
+	g_test_tiers_n = n;
+}
+#endif
+
+#ifndef UIDFAKE_HOST_TEST
 static const struct uf_tier *const g_tiers[] = {
 	&uf_tier_uid_inline, &uf_tier_uid_tables,     &uf_tier_setuid_inline,
 	&uf_tier_setuid_lsm, &uf_tier_setuid_setters,
 };
+#else
+/* empty: the host test always sets its own table with uf_tier_set_table() */
+static const struct uf_tier *const g_tiers[] = { NULL };
+#endif
+
+static const struct uf_tier *tier_at(unsigned int i)
+{
+#ifdef UIDFAKE_HOST_TEST
+	if (g_test_tiers)
+		return g_test_tiers[i];
+#endif
+	return g_tiers[i];
+}
+
+static unsigned int tier_count(void)
+{
+#ifdef UIDFAKE_HOST_TEST
+	if (g_test_tiers)
+		return g_test_tiers_n;
+#endif
+	return (unsigned int)ARRAY_SIZE(g_tiers);
+}
 
 #define UF_TIER_MAX 8
 static const struct uf_tier *g_installed[UF_TIER_MAX];
 static int g_installed_n;
-static const struct uf_tier *g_tried[ARRAY_SIZE(g_tiers)];
+static const struct uf_tier *g_tried[16];
 static int g_tried_n;
 
 static bool already_tried(const struct uf_tier *t)
@@ -52,10 +95,10 @@ int uf_tier_install(const char *family, const char *force)
 		 * One mechanism, named: a forced run has to show that one's answer,
 		 * including a failure, and not quietly fall through to another.
 		 */
-		for (i = 0; i < ARRAY_SIZE(g_tiers); i++) {
+		for (i = 0; i < tier_count(); i++) {
 			int rc;
 
-			t = g_tiers[i];
+			t = tier_at(i);
 			if (strcmp(t->family, family) != 0 ||
 			    strcmp(t->key, force) != 0)
 				continue;
@@ -75,8 +118,8 @@ int uf_tier_install(const char *family, const char *force)
 
 	for (;;) {
 		best = NULL;
-		for (i = 0; i < ARRAY_SIZE(g_tiers); i++) {
-			t = g_tiers[i];
+		for (i = 0; i < tier_count(); i++) {
+			t = tier_at(i);
 			if (strcmp(t->family, family) != 0 || already_tried(t))
 				continue;
 			if (!best || t->order < best->order)
@@ -84,7 +127,7 @@ int uf_tier_install(const char *family, const char *force)
 		}
 		if (!best)
 			break;
-		if (g_tried_n < (int)ARRAY_SIZE(g_tiers))
+		if (g_tried_n < (int)ARRAY_SIZE(g_tried))
 			g_tried[g_tried_n++] = best;
 
 		if (best->install() == 0) {

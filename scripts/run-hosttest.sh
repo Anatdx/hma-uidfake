@@ -64,6 +64,13 @@ clang -std=c23 -O1 -Wall -Wextra -Wno-unused-function -I src -I scripts -o "$inl
   scripts/inline_reloc_test.c src/inline.c
 "$inline"
 
+# The fallback chains: the real tiers.c with a table of fakes, so that order,
+# forcing and what a revert takes back are checked without a kernel.
+tiers=build/tiers_test
+clang -std=c23 -O1 -Wall -Wextra -DUIDFAKE_HOST_TEST -I src -I src/include \
+  -I scripts/hosttest -o "$tiers" scripts/tiers_test.c
+"$tiers"
+
 # Same sources, one more round under ASan/UBSan: a proxy outliving its owner is not
 # a warning, it is a fault the first time it runs.
 
@@ -88,6 +95,9 @@ clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wal
   src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
 clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -Wall -Wextra \
   -Wno-unused-function -I src -I scripts -o "$inline" scripts/inline_reloc_test.c src/inline.c
+clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -Wall -Wextra \
+  -DUIDFAKE_HOST_TEST -I src -I src/include -I scripts/hosttest -o "$tiers" \
+  scripts/tiers_test.c
 "$abx"
 "$paging"
 "$rules"
@@ -95,6 +105,7 @@ clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -Wall -W
 "$packages"
 "$packages_xml"
 "$inline"
+"$tiers"
 
 # The inode shadow block of src/inode_hook.c is kernel-only, so it is extracted and
 # driven here. The scenarios pin down what went wrong in it: an inode the package

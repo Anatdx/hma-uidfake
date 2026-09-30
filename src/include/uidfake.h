@@ -117,6 +117,50 @@ u32 policy_lookup_as(uid_t caller, uid_t target);
 	      * user; real devices stay well under this. */
 
 u32 uidfake_tag_app(void); /* app id + 1, or 0 when untagged */
+
+/* The name a waiting child gets from the apk it opened, and the end of its window. */
+void uidfake_tag_name(u32 app);
+void uidfake_tag_close(void);
+bool uidfake_tag_pending_here(void);
+
+/*
+ * The gate the hooks ask: does @target get hidden from whoever is calling? 0 when
+ * it does not, or when the caller is not an app with rules of its own.
+ */
+struct pt_regs;
+
+typedef long (*uidfake_syscall_t)(const struct pt_regs *);
+
+u32 policy_query(uid_t target);
+
+/* The status the mechanisms fill in (status.c). */
+void uidfake_status_add_flags(unsigned int flags);
+void uidfake_status_set_hooks_expected(unsigned int native,
+				       unsigned int compat);
+void uidfake_status_add_hooks(unsigned int native, unsigned int compat);
+void uidfake_status_add_hooks_expected(unsigned int native,
+				       unsigned int compat);
+
+/* The first bytes of a symbol about to be copied, when the debug key is on. */
+void uidfake_debug_dump(const char *name, unsigned long addr,
+			unsigned long size);
+
+static __always_inline u64 uf_select(u64 when_true, u64 when_false, u32 nonzero)
+{
+#if defined(__aarch64__)
+	u64 out;
+
+	asm("cmp\t%w3, #0\n\tcsel\t%0, %1, %2, ne"
+	    : "=r"(out)
+	    : "r"(when_true), "r"(when_false), "r"(nonzero));
+	return out;
+#else
+	/* The host test and the userspace model compile this file too. A real branch is fine
+	 * there: nothing is timed, and x86 is not the target. */
+	return nonzero ? when_true : when_false;
+#endif
+}
+
 int uidfake_apk_apply(const u32 *blob,
 		      u32 n); /* n * (st_dev, ino_lo, ino_hi, uid) */
 /*
@@ -159,8 +203,18 @@ int hooks_install(void);
 void hooks_remove(void);
 
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync);
+
+/* Read kernel text through the nofault copy, for diagnostics only. */
+bool uidfake_read(const void *src, void *dst, size_t len);
 int uidfake_patch_init(void);
 unsigned long uidfake_lookup(const char *name);
+
+/*
+ * A symbol's address and its extent: the following symbol bounds it, which is
+ * what copying a whole function needs to know.
+ */
+bool uidfake_symbol_range(const char *name, unsigned long *addr,
+			  unsigned long *size);
 
 /*
  * The address just past that symbol: the end of its body in kallsyms, which is

@@ -26,6 +26,7 @@
 
 #include "uidfake.h"
 #include "kaux.h"
+#include "tier.h"
 /*
  * Both generations live in this header: the list of hooks with a function
  * pointer each up to 6.11, and the per-hook static call table from 6.12 on. It
@@ -488,3 +489,12 @@ int uidfake_lsm_install(void)
 }
 
 #endif /* LINUX_VERSION_CODE < 6.12 */
+
+/*
+ * The LSM mechanism of the setuid family: the kernel hands task_fix_setuid both
+ * creds at the commit, and taking that hook is the least trouble of the three
+ * when it can be taken (inline_hooks.c is the one that runs first, and
+ * table_hooks.c the one behind this).
+ */
+UF_TIER(uf_tier_setuid_lsm, UF_TIER_SETUID, "lsm", "lsm task_fix_setuid", 20,
+	uidfake_lsm_install, uidfake_lsm_remove);

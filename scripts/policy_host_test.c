@@ -3,15 +3,13 @@
  * scale.
  */
 #include "policy.c"
+#include "tag.c" /* the tag record moved out of policy.c; this test covers both */
 #include <stdio.h>
 
 /* the host never logs anything, but the key has to exist for the linker */
 struct static_key_false uidfake_debug_key;
 
 /* the host has no isolated windows to close */
-void uidfake_tag_close(void)
-{
-}
 
 static u32 g_fail;
 static u32 t_pairs[400 * 200 * 2];

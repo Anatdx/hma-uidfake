@@ -41,8 +41,22 @@ constexpr std::size_t kApkLimit = 10000;
       line += " (module older than tool)";
     return line;
   }
-  line +=
-      ", uid " + std::to_string(st->native) + "+" + std::to_string(st->compat);
+  /*
+   * The uid counts are the syscall-table tier's: when the queries are answered
+   * from a find_user copy the tables were never touched, and printing 0+0 next
+   * to a working device is exactly the line that used to be misread as "nothing
+   * is hooked". So the tier is what gets printed, and the counts only where
+   * they mean something.
+   */
+  if (st->flags & KAUX_F_PRIO_INLINE)
+    line += ", uid queries=find_user";
+  else if (st->flags & KAUX_F_PRIO_TABLES)
+    line += ", uid queries=syscall tables, uid " + std::to_string(st->native) +
+            "+" + std::to_string(st->compat);
+  else
+    line += ", uid queries=not hidden";
+  if (st->last_error)
+    line += ", err=" + std::to_string(st->last_error);
   if (st->apk_inodes || st->apk_offered)
     line += ", apk " + std::to_string(st->apk_inodes);
   if (st->apk_failed)

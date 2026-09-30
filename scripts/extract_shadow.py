@@ -17,7 +17,7 @@ NEEDED = ("uf_shadow_open", "shadow_owner", "shadow_replace", "shadow_drop_id",
 
 def main() -> int:
     root = pathlib.Path(__file__).resolve().parents[1]
-    src = (root / "src" / "policy.c").read_text()
+    src = (root / "src" / "inode_hook.c").read_text()
     if BEGIN not in src or END not in src:
         print("extract_shadow: the markers are gone from src/policy.c",
               file=sys.stderr)

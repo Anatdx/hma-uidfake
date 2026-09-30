@@ -107,6 +107,11 @@ struct kaux_status {
 #define KAUX_F_COMPAT 0x2u
 #define KAUX_F_SETUID 0x4u
 #define KAUX_F_APKS 0x8u /* the last apk apply put every entry in place */
+/* How the uid queries are answered: from a copy of find_user (one inline hook,
+ * nothing in the syscall tables), or from the syscall tables. Neither set means
+ * the queries are not answered at all. */
+#define KAUX_F_PRIO_INLINE 0x10u
+#define KAUX_F_PRIO_TABLES 0x20u
 
 #define KAUX_LSM_NONE 0
 #define KAUX_LSM_TAKEN 1

@@ -211,6 +211,23 @@ unsigned long uidfake_lookup_raw(const char *name)
 		return ctx.addr;
 	}
 }
+
+/*
+ * A symbol's address and extent, for a caller that has to copy the function whole:
+ * the following symbol bounds it, and the walk already computes that.
+ */
+bool uidfake_symbol_range(const char *name, unsigned long *addr,
+			  unsigned long *size)
+{
+	struct find_ctx ctx;
+
+	find_symbol(name, &ctx);
+	if (!ctx.addr || ctx.next <= ctx.addr)
+		return false;
+	*addr = ctx.addr;
+	*size = ctx.next - ctx.addr;
+	return true;
+}
 /*
  * Symbols the patcher needs at run time. init_mm is not exported,
  * kimage_voffset/kallsyms are not either, so all of them go through the same
@@ -222,9 +239,26 @@ static struct mm_struct *patch_mm;
 static phys_addr_t phys_from_virt(unsigned long addr);
 static phys_addr_t image_phys(unsigned long addr);
 
-/* [_stext, _end): the only range this module is willing to write into. */
+/*
+ * The ranges this module may write: the kernel image, and its own text, where the
+ * copy of a hooked function and the stub that jumps into it live.
+ */
+static unsigned long g_mod_start;
+static unsigned long g_mod_end;
 static unsigned long g_text_start;
 static unsigned long g_text_end;
+
+static bool writable_range(unsigned long addr, size_t len)
+{
+	if (g_text_start && g_text_end && addr >= g_text_start &&
+	    addr + len <= g_text_end)
+		return true;
+	if (g_mod_start && g_mod_end && addr >= g_mod_start &&
+	    addr + len <= g_mod_end)
+		return true;
+	return false;
+}
+
 static unsigned long *g_kimage_voffset;
 static unsigned long *g_memstart_addr;
 static bool g_offset_warned;
@@ -278,6 +312,44 @@ static noinline long __nocfi patch_copy_nofault(void *dst, const void *src,
 	return ((uf_copy_nofault_t)g_copy_nofault_addr)(dst, src, size);
 }
 
+/*
+ * Read kernel text for a diagnostic. It is the same nofault copy the patcher
+ * uses, exposed because the debug dump reads a symbol it is about to rewrite:
+ * an ordinary load could fault on a page this context may not take.
+ */
+static noinline long __nocfi patch_copy_from_nofault(void *dst, const void *src,
+						     size_t size);
+
+/*
+ * The first bytes of a symbol this module is about to copy, through the nofault
+ * copy. It is what makes a device's own code available for a host test, and what
+ * tells a reader which encoding a refusal was about.
+ */
+void uidfake_debug_dump(const char *name, unsigned long addr,
+			unsigned long size)
+{
+	u8 buf[64];
+	unsigned long n = size < sizeof(buf) ? size : sizeof(buf);
+	unsigned long i;
+
+	if (!UF_DEBUG_ON() || n == 0)
+		return;
+	if (!uidfake_read((const void *)addr, buf, n))
+		return;
+	pr_info("uidfake: %s at %#lx, %lu of %lu bytes:\n", name, addr, n,
+		size);
+	for (i = 0; i < n; i += 16)
+		pr_info("uidfake:  %*phN\n", (int)(n - i < 16 ? n - i : 16),
+			buf + i);
+}
+
+bool uidfake_read(const void *src, void *dst, size_t len)
+{
+	if (!g_copy_from_nofault_addr)
+		return false;
+	return patch_copy_from_nofault(dst, src, len) == 0;
+}
+
 static noinline long __nocfi patch_copy_from_nofault(void *dst, const void *src,
 						     size_t size)
 {
@@ -292,6 +364,20 @@ int uidfake_patch_init(void)
 	g_text_start = uidfake_lookup("_stext");
 	g_text_end = uidfake_lookup("_end");
 
+	/*
+	 * This module's own text: the copy of a hooked function and the stub that
+	 * jumps into it are written there, so the patcher has to know the range.
+	 * The layout field changed shape in 6.4 - module_layout gave way to an
+	 * array of module_memory - so both spellings are read here.
+	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	g_mod_start = (unsigned long)THIS_MODULE->mem[MOD_TEXT].base;
+	g_mod_end = g_mod_start + THIS_MODULE->mem[MOD_TEXT].size;
+#else
+	g_mod_start = (unsigned long)THIS_MODULE->core_layout.base;
+	g_mod_end = g_mod_start + THIS_MODULE->core_layout.text_size;
+#endif
+
 	patch_mm = (struct mm_struct *)uidfake_lookup("init_mm");
 	g_kimage_voffset = (unsigned long *)uidfake_lookup("kimage_voffset");
 	g_memstart_addr = (unsigned long *)uidfake_lookup("memstart_addr");
@@ -305,10 +391,11 @@ int uidfake_patch_init(void)
 		g_copy_from_nofault_addr =
 			uidfake_lookup("__copy_from_kernel_nofault");
 	if (UF_DEBUG_ON())
-		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px set_fixmap=%px nofault=%px\n",
-			patch_mm, (void *)g_kimage_voffset,
+		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px set_fixmap=%px nofault=%px mod=%#lx-%#lx\n",
+			(void *)patch_mm, (void *)g_kimage_voffset,
 			(void *)g_memstart_addr, (void *)g_set_fixmap_addr,
-			(void *)g_copy_nofault_addr);
+			(void *)g_copy_nofault_addr, (unsigned long)g_mod_start,
+			(unsigned long)g_mod_end);
 	if (!patch_mm || !g_set_fixmap_addr)
 		return -ENOENT;
 
@@ -488,6 +575,11 @@ static int patch_nosync(void *dst, const void *src, size_t len)
 	 * against, which is where the walk gives up. The walk is the second opinion
 	 * then, and the fallback where the offset is not readable.
 	 */
+	/* A module address is not in the image, so the image offset cannot translate
+	 * it: the page-table walk is the only source there. */
+	if (g_mod_start && p >= g_mod_start && p < g_mod_end)
+		offset = 0;
+
 	if (offset) {
 		if (walk && walk != offset) {
 			pr_warn("uidfake: refusing to write: the walk and the image offset disagree\n");
@@ -592,9 +684,8 @@ int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 	/* Refuse anything outside the kernel image before a single byte is written:
 	 * a wrong physical address used to be caught only by reading the target
 	 * back, which is too late -- the stray write has already happened. */
-	if (!g_text_start || !g_text_end || (unsigned long)dst < g_text_start ||
-	    (unsigned long)dst + len > g_text_end) {
-		pr_warn("uidfake: refusing to patch: outside the kernel image\n");
+	if (!writable_range((unsigned long)dst, len)) {
+		pr_warn("uidfake: refusing to patch: neither the kernel image nor this module\n");
 		if (UF_DEBUG_ON())
 			pr_info("uidfake:   %px\n", dst);
 		return -EPERM;

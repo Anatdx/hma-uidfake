@@ -234,7 +234,10 @@ static void setup_b(int held)
 
 #include "shadow_block.inc"
 
-static bool uidfake_tag_pending_here(void)
+/* The block asks the tag record two questions (see tag.c): nothing here is
+ * waiting for a name, and the name itself is what the test that follows checks
+ * by hand rather than through the hook. */
+bool uidfake_tag_pending_here(void)
 {
 	return false;
 }

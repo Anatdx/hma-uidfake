@@ -96,6 +96,22 @@ constexpr auto kHmaOssConfig = R"({
   }
 })";
 
+/* One caller that applies the xposed preset and nothing else: the manager is
+ * written into that preset by the app's own code, not by its cache. */
+constexpr auto kXposedConfig = R"({
+  "configVersion": 4,
+  "scope": {
+    "com.example.caller": {
+      "useWhitelist": false,
+      "excludeSystemApps": true,
+      "applyTemplates": [],
+      "applyPresets": ["xposed"],
+      "extraAppList": [],
+      "extraOppositeAppList": []
+    }
+  }
+})";
+
 void test_user_ids()
 {
 	const auto user0 = uidfake::parse_user_id("0");
@@ -180,10 +196,49 @@ void test_preset_cache()
 
 } // namespace
 
+/* The manager writes itself into the xposed preset in the app's own code and its
+ * cache carries the scanned half only, so a device's cache holds the preset
+ * without the manager. The decision still has to hide it, and only for a caller
+ * that applies the preset. */
+void test_xposed_preset()
+{
+	/*
+	 * A device's cache carries the scanned half of xposed only: the manager is
+	 * written into the preset in code (XposedModulesPreset.exactPackageNames).
+	 * The decision still has to hide it, and only for callers that apply it.
+	 */
+	const auto xposed_config = write_config(
+		"preset_cache_test/config_xposed.json", kXposedConfig);
+	write_config("preset_cache_test/preset_cache_v2.json",
+		     "{\"cache\":{\"xposed\":[\"com.example.module\"]}}");
+	uidfake::PresetFacts xposed_facts;
+	const auto xposed_presets =
+		uidfake::load_preset_cache(xposed_config, xposed_facts);
+	const auto xposed_rules = HmaOssRules::load(xposed_config);
+	check(xposed_rules && xposed_rules->hides("com.example.caller",
+						  "com.example.module", false,
+						  xposed_presets),
+	      true, "xposed: a cached member is hidden");
+	check(xposed_rules && xposed_rules->hides("com.example.caller",
+						  "org.frknkrc44.hma_oss",
+						  false, xposed_presets),
+	      true,
+	      "xposed: the manager is hidden although the cache omits it");
+	check(xposed_rules && xposed_rules->hides("com.example.other",
+						  "org.frknkrc44.hma_oss",
+						  false, xposed_presets),
+	      false, "xposed: a caller outside the scope hides nothing");
+	const auto dir = xposed_config.parent_path();
+	std::filesystem::remove(xposed_config);
+	std::filesystem::remove(dir / uidfake::kPresetCacheNew);
+	std::filesystem::remove(dir);
+}
+
 int main()
 {
 	test_user_ids();
 	test_preset_cache();
+	test_xposed_preset();
 	const auto hma_path = write_config("rules_hma.json", kHmaConfig);
 	const auto oss_path = write_config("rules_oss.json", kHmaOssConfig);
 

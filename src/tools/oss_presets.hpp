@@ -160,8 +160,10 @@ inline constexpr std::array ksus_apps{
     std::string_view{"org.fossify.filemanager"},
 };
 
-/* xposed: no written-in names */
-inline constexpr std::array<std::string_view, 0> kxposed{};
+/* xposed */
+inline constexpr std::array kxposed{
+    std::string_view{"org.frknkrc44.hma_oss"},
+};
 
 /* The preset name each written-in set belongs to. */
 struct StaticPreset {

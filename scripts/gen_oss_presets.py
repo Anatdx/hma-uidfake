@@ -13,32 +13,68 @@ import sys
 from pathlib import Path
 
 
+# The bare name a preset class may hold instead of a string: HMA's own package.
+OWN_PACKAGE_TOKEN = 'BuildConfig.APP_PACKAGE_NAME'
+RESOLVED_NAMES = ('setOf', 'listOf', 'String')
+
+
 def strings_of(text: str):
     return re.findall(r'"([A-Za-z0-9_.$:-]+)"', text)
 
 
-def extract(path: Path):
-    """The quoted strings of the `exactPackageNames` assignment, brace balanced."""
+def own_package_name(src_dir: Path) -> str:
+    """BuildConfig.APP_PACKAGE_NAME, read from the app's build script."""
+    for parent in [src_dir, *src_dir.parents]:
+        script = parent / 'build.gradle.kts'
+        if not script.is_file():
+            continue
+        m = re.search(r'val appPackageName by extra\("([^"]+)"\)',
+                      script.read_text(encoding='utf-8', errors='replace'))
+        if m:
+            return m.group(1)
+    raise SystemExit('  \u2717 %s \u672a\u89e3\u6790\uff1a\u5f80\u4e0a\u627e\u4e0d\u5230 build.gradle.kts '
+                     '\u91cc\u7684 appPackageName' % OWN_PACKAGE_TOKEN)
+
+
+def extract(path: Path, own_package: str):
+    """The packages of the `exactPackageNames` assignment, brace balanced.
+
+    A bare BuildConfig name is a package too, and anything else that is not a
+    string stops the run: a table that is quietly smaller than the app's preset
+    hides less than the app does, which is the bug this file exists for.
+    """
     src = path.read_text(encoding='utf-8', errors='replace')
     m = re.search(r'exactPackageNames\s*(?::[^=]*)?=\s*', src)
     if not m:
         return None
     rest = src[m.end():]
     head = rest.lstrip()
-    if head.startswith('setOf(') or head.startswith('listOf('):
+    if head.startswith(('setOf', 'listOf')) and '(' in head:
         i = rest.index('(')
         depth = 0
+        body = rest[i:]
         for j in range(i, len(rest)):
             if rest[j] == '(':
                 depth += 1
             elif rest[j] == ')':
                 depth -= 1
                 if depth == 0:
-                    return strings_of(rest[i:j])
-        return strings_of(rest[i:])
-    # an expression, e.g. a concatenation of arrays
-    end = rest.find('\n    }')
-    return strings_of(rest[:end if end > 0 else 4000])
+                    body = rest[i:j]
+                    break
+    else:
+        # an expression, e.g. a concatenation of arrays
+        end = rest.find('\n    }')
+        body = rest[:end if end > 0 else 4000]
+    found = strings_of(body)
+    if re.search(r'\b%s\b' % re.escape(OWN_PACKAGE_TOKEN), body):
+        found.append(own_package)
+    leftover = re.sub(r'//[^\n]*|/\*.*?\*/', '', body, flags=re.S)
+    leftover = re.sub(r'"[^"]*"', '', leftover).replace(OWN_PACKAGE_TOKEN, '')
+    leftover = re.sub(r'\b(%s)\b' % '|'.join(RESOLVED_NAMES), '', leftover)
+    if re.search(r'[A-Za-z_]', leftover):
+        raise SystemExit('  \u2717 %s: exactPackageNames \u91cc\u6709\u672a\u89e3\u6790\u7684\u6807\u8bc6\u7b26\uff1a%s'
+                         % (path.name, ' '.join(leftover.split())[:60]))
+    return found
 
 
 def preset_name(path: Path) -> str:
@@ -50,12 +86,14 @@ def preset_name(path: Path) -> str:
 
 def main():
     src_dir, out_path = Path(sys.argv[1]), Path(sys.argv[2])
+    own_package = own_package_name(src_dir)
+    print('  %s = %s (from build.gradle.kts)' % (OWN_PACKAGE_TOKEN, own_package))
     names = {}
     for path in sorted(src_dir.glob('*Preset.kt')):
         if path.name == 'BasePreset.kt':
             continue
         cls = path.stem
-        found = extract(path)
+        found = extract(path, own_package)
         if found is None:
             print('  %-24s exactPackageNames: 未找到（可能是纯规则 ✓）' % cls)
             continue

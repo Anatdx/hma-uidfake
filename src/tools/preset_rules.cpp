@@ -283,11 +283,9 @@ Presets scan_presets(const ScanMap &apps,
         apk_has_any(apps, name,
                     {"assets/xposed_init", "META-INF/xposed/module.prop"}))
       presets["xposed"].insert(std::string{name});
-    if (want_xposed)
-      for (const std::string_view own :
-           {"org.frknkrc44.hma_oss", "icu.nullptr.hidemyapplist"})
-        if (apps.contains(own))
-          presets["xposed"].insert(std::string{own});
+    /* The manager writes itself into this preset (XposedModulesPreset), so that
+     * half lives in oss_presets.hpp with every other preset's written-in half.
+     */
 
     /* shizuku_dhizuku */
     if (name.starts_with("moe.shizuku."))

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 // Regression test for the OSS presets: every case names the line of HMA-OSS's
 // app_presets/*.kt it stands for.
+#include "oss_presets.hpp"
 #include "rules.hpp"
 
 #include <cstdio>
@@ -41,6 +42,19 @@ bool in(std::string_view preset, std::string_view pkg)
 {
 	const auto it = g_presets.find(std::string{ preset });
 	return it != g_presets.end() && it->second.contains(std::string{ pkg });
+}
+
+/* The half HMA-OSS keeps in code: its own cache never carries it. */
+bool in_static(std::string_view preset, std::string_view pkg)
+{
+	for (const auto &entry : uidfake::oss_presets::kStatic) {
+		if (entry.name != preset)
+			continue;
+		for (std::size_t i = 0; i < entry.count; ++i)
+			if (entry.packages[i] == pkg)
+				return true;
+	}
+	return false;
 }
 
 void check(bool got, bool want, std::string_view preset, std::string_view pkg,
@@ -158,7 +172,10 @@ int main()
 	      "shizuku_dhizuku", "com.example.shizuku", "shizuku provider");
 	check(in("xposed", "com.example.xposed_legacy"), true, "xposed",
 	      "com.example.xposed_legacy", "legacy entry");
-	check(in("xposed", "org.frknkrc44.hma_oss"), true, "xposed",
+	/* XposedModulesPreset.exactPackageNames is BuildConfig.APP_PACKAGE_NAME: the
+	 * app writes itself in, and the scan cannot see that, the cache does not
+	 * carry it. */
+	check(in_static("xposed", "org.frknkrc44.hma_oss"), true, "xposed",
 	      "org.frknkrc44.hma_oss", "the app itself");
 	check(in("custom_rom", "eu.xiaomi.something"), true, "custom_rom",
 	      "eu.xiaomi.something", "xiaomi.eu");

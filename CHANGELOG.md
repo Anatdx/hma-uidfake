@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0
+
+- Every hook mechanism is its own file, and which one is in place is a registry rather than a chain
+  of `if`s. There are two questions -- how a uid with no processes is reported, and where an identity
+  change is seen -- and for each one the mechanisms register an order and the runner walks them until
+  one installs. The inline mechanism comes first for both today: the uid queries are answered from a
+  relocated copy of `find_user`, and the id change from a relocated copy of `cap_task_fix_setuid`,
+  which the kernel hands both creds. The LSM hook and the syscall tables are the mechanisms behind
+  them, and the order is data: moving one is a single number. `uidfake.setuid_tier=` and
+  `uidfake.uid_tier=` force one mechanism, which tries only what it names, so a device can show that
+  each of them works on its own.
+
+- The copy is built at load time from the function's own bytes, and every operand that leaves the
+  function is rewritten into an absolute form: `adrp` pairs, `bl` targets, and the branch encodings a
+  function uses for itself. An encoding the relocator does not handle is a refusal, never a guess, and
+  a refusal is what the next mechanism is for. The entry patch is twelve bytes of `adrp`/`add`/`br`
+  with no literal pool, and the stub and the copies live in one asm-declared section that is executable
+  and not writable at once -- a C array under a `.text` name is writable and executable at the same
+  time, which a kernel with `STRICT_MODULE_RWX` refuses to load at all (it did, on the first try).
+
+- A hidden uid no longer costs anything a clock can find. The answer is the same object the kernel
+  returns for a uid that has no processes (`NULL`, after giving the reference back), reached by the
+  same code, so the two are interchangeable: `uidbench` measures 0.3 to 0.5 ns of difference, which is
+  below the spread between two uids that do not exist, and the two previous failures it reports -- a
+  branch on the answer, and a replacement uid the kernel takes longer to reject -- are both gone.
+
+- The status line says which mechanism is in place (`uid queries=inline find_user`,
+  `setuid=inline cap_task_fix_setuid`) and, when none is, what the last one to fail said (through the
+  `last_error` the tool already prints as `err=`).
+
+- The registry is an explicit table, not a linker-collected section: `__start_`/`__stop_` symbols for
+  a module's own section come out undefined on every KMI built here (kbuild with LTO), which would
+  have been a module that does not load at all.
+
+- The host test's `sched` shim closes its include guard, which it never did: harmless while every
+  translation unit included it once, and two definitions of `current_fsuid` the moment the tag record
+  moved into a file of its own.
+
 ## 0.3.3
 
 - The tool reads the package database whichever form it is written in. Android 12 introduced the

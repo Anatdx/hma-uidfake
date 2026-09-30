@@ -1,10 +1,70 @@
 # Design
 
+## Layout
+
+One file per mechanism, so that what can be swapped is a swap of a file and not of an `if`:
+
+```
+inline_hooks.c    the two mechanisms that run a copy of a kernel function (find_user,
+                  cap_task_fix_setuid): the copy is built by inline.c and entered through a
+                  twelve byte patch at the function's own entry
+table_hooks.c     the two mechanisms that rewrite sys_call_table entries, one for the uid
+                  queries and one for the id setters, plus that table plumbing itself
+inode_hook.c      the apk side: the base.apk of an app with rules has ->open replaced
+lsm.c             the LSM hook the kernel hands both creds to at the commit (task_fix_setuid)
+inline.c          the relocator: whole function, PC-relative operands rewritten or refused
+tiers.c           the walk: try a family's mechanisms in order, remember what won
+tag.c status.c    the identity record, and what the module reports about itself
+policy.c          the rules, and the query the hooks ask
+hooks.c           the two families and their order
+```
+
+## Mechanisms and their order
+
+There are two questions, and more than one mechanism can answer each of them. Which one works
+depends on the kernel it was not built for, so each mechanism is a struct with the order it wants to
+be tried in, one definition in its own file, and one line in the table in `tiers.c`. The runner walks
+a family in that order until one installs; a mechanism that fails says so and the next one is tried.
+
+| family | order | mechanism | answers from |
+| --- | --- | --- | --- |
+| uid queries | 10 | `inline find_user` | a relocated copy of `find_user`, entered at its own entry |
+| uid queries | 20 | `syscall tables` | the four entries in `sys_call_table` (and their 32-bit numbers) |
+| setuid | 10 | `inline cap_task_fix_setuid` | a relocated copy of what implements the LSM hook |
+| setuid | 20 | `lsm task_fix_setuid` | the LSM hook itself, taken by replacing its pointer or static call |
+| setuid | 30 | `syscall setters` | the six setters in both syscall tables |
+
+The order is data: moving a mechanism is one number. A mechanism can also be forced, which is how
+the table above is checked on a device -- a forced run tries only what it names, so that a failure
+is reported rather than quietly replaced:
+
+```
+lkmloader hma_uidfake.ko setuid_tier=inline     # or lsm, or setters
+lkmloader hma_uidfake.ko uid_tier=tables        # or inline
+```
+
+An inline mechanism never guesses: the copy is built from the function's own bytes and every operand
+that leaves the function is rewritten into an absolute form (see `include/inline.h`); an encoding
+the relocator does not know is a refusal, and the refusal is what the next mechanism is for. The
+entry patch is twelve bytes -- `adrp`/`add`/`br x17` -- and no literal pool, because a module sits
+further from the kernel's text than a literal load can reach; the stub it jumps to is written in asm,
+so that the section holding the copies is executable and not writable at once, which a kernel with
+`STRICT_MODULE_RWX` insists on.
+
+The registry is an explicit table and not a linker-collected section. A section would need
+`__start_`/`__stop_` symbols, and this toolchain (kbuild with LTO, on every KMI compiled here) does
+not synthesise them for a module: the symbols come out undefined and the module would not load. That
+was measured on all six KMIs, not assumed.
+
 ## Queries
 
-The four syscalls a uid scanner uses have their entries in `sys_call_table` (and the AArch32 numbers
-in `compat_sys_call_table`) redirected, not the syscalls themselves: the hook substitutes the uid
-argument and calls the original, which takes its own "no such uid" branch. The caller side comes
+The four syscalls a uid scanner uses reach `find_user()`, the one place that decides whether a uid
+has processes at all. The first mechanism answers them there, from a relocated copy of that function:
+the real answer is computed and then dropped, so a hidden uid answers exactly like a uid with no
+processes, on the same code path and at the same cost -- measured at 0.3 to 0.5 ns of difference,
+below the spread between two uids that do not exist. The mechanism behind it redirects the entries in
+`sys_call_table` (and the AArch32 numbers in `compat_sys_call_table`) instead: the hook substitutes
+the uid argument and calls the original, which takes its own "no such uid" branch. The caller side comes
 from the birth tag rather than from the current uid -- one table load and a `csel` -- so changing
 uid cannot move a process into another set of rules. `/proc` and ptrace see the argument as the
 caller wrote it, and there is nothing to restore.
@@ -59,6 +119,9 @@ goes through a nofault copy.
   this module was built with. Two candidates are tried, this build's and the one derived from the
   kernel's own `vmemmap` (`FIXADDR_TOP = VMEMMAP_START - SZ_32M`), and each is proved before use:
   the bytes at the alias have to be the bytes at the target. Neither proved means nothing is written.
+- An inline hook is two writes: the whole function, relocated into this module's own text, and the
+  twelve byte entry patch that sends callers there. Both go through the same alias path, both are read
+  back, and the bytes the entry patch replaced are kept verbatim so the unload can put them back.
 - The page table walk is a second opinion and is calibrated against the image offset once at load. A
   kernel whose `struct mm_struct` or geometry is not this module's makes the walk answer with a
   different page; the offset is the one that does not care, and it is what the write needs.

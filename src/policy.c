@@ -431,16 +431,11 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 	 * targets at all. A line carries one target per slot, and a slot serves at most
 	 * POLICY_PROBE_MAX targets (its own line and the ones that follow), so the floor is
 	 * the target count over POLICY_WAY * POLICY_PROBE_MAX, rounded up to a power of two
-	 * and grown by the fit search when the targets do not spread out evenly. Starting
-	 * there -- rather than at the smallest candidate and doubling -- is what lets the
-	 * search find the 256 KB table instead of stopping at the 2 MB one.
+	 * and grown by the fit search when the targets do not spread out evenly.
 	 */
 	{
 		u32 nt_seen = 0;
 
-		nlines = 1u << (g_hash.bits > 3 ? g_hash.bits - 3 : 0);
-		if (nlines > POLICY_MAX_LINES)
-			nlines = POLICY_MAX_LINES;
 		for (i = 0; i < n; i++) {
 			if (i && p[i - 1].target == p[i].target)
 				continue;

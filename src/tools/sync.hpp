@@ -40,7 +40,7 @@ struct Config {
 
 class Syncer {
 public:
-  explicit Syncer(Config config) : config_(config) {}
+  explicit Syncer(Config config) : config_(std::move(config)) {}
 
   void sync_now(std::string_view why = "startup");
 

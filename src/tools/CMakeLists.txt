@@ -14,6 +14,8 @@ find_package(nlohmann_json REQUIRED)
 
 add_executable(sync-tool
     abx.cpp
+    text_xml.cpp
+    packages_xml.cpp
     main.cpp
     sync.cpp
     watcher.cpp

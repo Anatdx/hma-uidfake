@@ -26,7 +26,6 @@ struct ScanTarget {
   std::uint32_t uid = 0;
   std::filesystem::path code_dir;
   bool system = false;
-  std::set<std::string, std::less<>> perms;
 };
 
 using ScanMap = std::map<std::string, ScanTarget, std::less<>>;
@@ -104,7 +103,7 @@ public:
   }
 
   /* Facts the decision needs that do not live in the config file. */
-  virtual void set_preset_facts(PresetFacts facts) { (void)facts; }
+  virtual void set_preset_facts(const PresetFacts &facts) { (void)facts; }
 
   [[nodiscard]] Tool tool() const { return tool_; }
   [[nodiscard]] const std::filesystem::path &path() const { return path_; }
@@ -209,9 +208,7 @@ public:
                            const Presets &presets) const override;
   [[nodiscard]] bool uses_presets() const override { return true; }
   [[nodiscard]] std::vector<std::string> presets_in_use() const override;
-  void set_preset_facts(PresetFacts facts) override {
-    facts_ = std::move(facts);
-  }
+  void set_preset_facts(const PresetFacts &facts) override { facts_ = facts; }
 
   /* What one caller's entry was read as, for the log. */
   [[nodiscard]] std::string describe(const nlohmann::json &entry,

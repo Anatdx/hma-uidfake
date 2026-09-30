@@ -177,13 +177,12 @@ Syncer::open_rules(const std::filesystem::path &file,
         for (const auto &[name, info] : packages.by_name())
           apps.emplace(name, ScanTarget{.uid = info.uid,
                                         .code_dir = info.code_dir,
-                                        .system = info.system,
-                                        .perms = info.perms});
+                                        .system = info.system});
         facts.scanned = scan_presets(apps, missing);
       }
     }
   }
-  rules->set_preset_facts(std::move(facts));
+  rules->set_preset_facts(facts);
   return OpenedRules{.rules = std::move(rules), .presets = std::move(presets)};
 }
 

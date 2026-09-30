@@ -111,8 +111,13 @@ void report_status(std::string_view text) {
   while (std::getline(in, line)) {
     if (line.rfind("description=", 0) == 0) {
       const auto rest = strip_status(line.substr(12));
-      line = wanted.empty() ? "description=" + rest
-                            : "description=[" + wanted + "] " + rest;
+      std::string rebuilt = "description=";
+      if (!wanted.empty()) {
+        rebuilt += '[';
+        rebuilt += wanted;
+        rebuilt += "] ";
+      }
+      line = rebuilt + rest;
       touched = true;
     }
     lines.push_back(line);

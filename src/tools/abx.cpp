@@ -341,4 +341,8 @@ Reader::Event Reader::next() {
   }
 }
 
+bool is_abx(std::span<const std::uint8_t> data) {
+  return data.size() >= sizeof(kMagic) &&
+         std::memcmp(data.data(), kMagic, sizeof(kMagic)) == 0;
+}
 } // namespace uidfake::abx

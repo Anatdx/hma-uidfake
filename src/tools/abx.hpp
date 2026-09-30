@@ -7,6 +7,8 @@
 #include <string>
 #include <string_view>
 
+#include "packages_xml.hpp"
+
 namespace uidfake::abx {
 
 /*
@@ -27,18 +29,9 @@ namespace uidfake::abx {
  */
 class Reader {
 public:
-  struct Event {
-    enum class Kind { StartTag, EndTag, Attribute, Text, EndDocument, Bad };
-
-    Kind kind = Kind::Bad;
-    /* Tag or attribute name; for Text the text itself. */
-    std::string_view name;
-    /* String payload of an attribute, or its text form for integers. */
-    std::string_view value;
-    /* Integer payload, when the attribute carried one. */
-    std::uint64_t number = 0;
-    bool numeric = false;
-  };
+  /* The event type is the one the entry header defines: this reader is one of
+   * the two that produce it, and nothing outside the entry uses either. */
+  using Event = packages_xml::Event;
 
   explicit Reader(std::span<const std::uint8_t> data) : data_(data) {}
 
@@ -91,5 +84,8 @@ private:
    * they still have to outlive the view handed to the caller. */
   std::deque<std::string> values_;
 };
+
+/* True for the binary form: the magic every ABX file starts with. */
+[[nodiscard]] bool is_abx(std::span<const std::uint8_t> data);
 
 } // namespace uidfake::abx

@@ -111,7 +111,7 @@ typedef long (*uidfake_syscall_t)(const struct pt_regs *);
  * someone else's syscall; looking the wrapper up instead cannot do that, and an
  * entry that cannot be found is simply not hooked.
  */
-struct hook_entry {
+struct hook_entry { // NOLINT(clang-analyzer-optin.performance.Padding)
 	unsigned int nr;
 	uidfake_syscall_t ours;
 	uidfake_syscall_t orig;

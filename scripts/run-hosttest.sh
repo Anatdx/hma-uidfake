@@ -31,15 +31,31 @@ clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wda
 rules=build/rules_test
 clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
   src/tools/preset_rules.cpp \
-  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
+  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
 "$rules"
 
 presets=build/presets_test
 clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
   -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
   -Wdouble-promotion -Wformat=2 -I src/tools -o "$presets" scripts/presets_test.cpp \
-  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp -lz
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp -lz
 "$presets"
+
+packages=build/packages_test
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$packages" scripts/packages_test.cpp \
+  src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp src/tools/paths.cpp
+"$packages"
+
+
+
+packages_xml=build/packages_xml_test
+clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$packages_xml" scripts/packages_xml_test.cpp \
+  src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
+"$packages_xml"
 
 # Same sources, one more round under ASan/UBSan: a proxy outliving its owner is not
 # a warning, it is a fault the first time it runs.
@@ -49,15 +65,26 @@ clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wal
 clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp -lz
 clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
   src/tools/preset_rules.cpp \
-  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp
+  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
 clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
   -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
   -Wdouble-promotion -Wformat=2 -I src/tools -o "$presets" scripts/presets_test.cpp \
-  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp -lz
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp -lz
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$packages" scripts/packages_test.cpp \
+  src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp src/tools/paths.cpp
+
+clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl \
+  -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference \
+  -Wdouble-promotion -Wformat=2 -I src/tools -o "$packages_xml" scripts/packages_xml_test.cpp \
+  src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
 "$abx"
 "$paging"
 "$rules"
 "$presets"
+"$packages"
+"$packages_xml"
 
 # The inode shadow block of src/policy.c is kernel-only, so it is extracted and
 # driven here. The scenarios pin down what went wrong in it: an inode the package

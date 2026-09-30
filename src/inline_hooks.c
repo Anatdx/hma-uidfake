@@ -171,13 +171,20 @@ static void find_user_hook_remove(void)
 {
 	if (!g_find_user_hooked)
 		return;
+	/*
+	 * A restore that does not take is the one failure this module cannot undo:
+	 * the entry still points into this text, so unloading would leave a wild
+	 * branch behind. It is louder than a warning for that reason, and the only
+	 * way it happens is another patcher having taken the same twelve bytes since
+	 * we wrote them -- so it is not retried, it is reported.
+	 */
 	if (uidfake_patch_text((void *)g_find_user_addr, g_find_user_saved,
 			       UF_INLINE_ENTRY, true) == 0 &&
 	    memcmp((const void *)g_find_user_addr, g_find_user_saved,
 		   UF_INLINE_ENTRY) == 0)
 		g_find_user_hooked = false;
 	else
-		pr_warn("uidfake: could not put find_user back\n");
+		pr_err("uidfake: could not put find_user back; do NOT unload this module\n");
 }
 extern int uf_setuid_stub(struct cred *new, const struct cred *old, int flags);
 int uf_setuid_inline_hook(struct cred *new, const struct cred *old, int flags);
@@ -355,8 +362,8 @@ static void setuid_inline_remove(void)
 		   UF_INLINE_ENTRY) == 0)
 		g_setuid_hooked = false;
 	else
-		pr_warn("uidfake: could not put %s back\n",
-			g_setuid_name ? g_setuid_name : "cap_task_fix_setuid");
+		pr_err("uidfake: could not put %s back; do NOT unload this module\n",
+		       g_setuid_name ? g_setuid_name : "cap_task_fix_setuid");
 }
 
 /*

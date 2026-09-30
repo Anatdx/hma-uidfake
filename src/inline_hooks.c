@@ -68,10 +68,19 @@ asm(".pushsection \".text.uf_inline\",\"ax\"\n"
  * about to be hidden costs what an answer that names a uid with no processes
  * costs; only the result is dropped.
  */
+/*
+ * The call into the copy, from a function that may itself be reached through an
+ * indirect call: on a kernel with CFI both ends of that are checked, and the copy
+ * is in no jump table, so this is marked the way KernelSU marks its dispatcher.
+ */
+static noinline struct user_struct *__nocfi uf_find_user_orig(kuid_t uid)
+{
+	return ((struct user_struct * (*)(kuid_t)) g_find_user_copy)(uid);
+}
+
 noinline struct user_struct *uf_find_user_hook(kuid_t uid)
 {
-	struct user_struct *real =
-		((struct user_struct * (*)(kuid_t)) g_find_user_copy)(uid);
+	struct user_struct *real = uf_find_user_orig(uid);
 
 	if (real == NULL)
 		return NULL;
@@ -102,7 +111,7 @@ static int find_user_hook_install(void)
 		uidfake_status_note(-ENOENT);
 		return -ENOENT;
 	}
-	if (size == 0 || size > sizeof(scratch)) {
+	if (size < UF_INLINE_ENTRY || size > sizeof(scratch)) {
 		pr_warn("uidfake: find_user is %lu bytes, past the copy\n",
 			size);
 		uidfake_status_note(-E2BIG);
@@ -282,7 +291,7 @@ static int setuid_inline_install(void)
 		uidfake_status_note(-ENOENT);
 		return -ENOENT;
 	}
-	if (size == 0 || size > sizeof(scratch)) {
+	if (size < UF_INLINE_ENTRY || size > sizeof(scratch)) {
 		pr_warn("uidfake: %s is %lu bytes, past the copy\n", name,
 			size);
 		uidfake_status_note(-E2BIG);

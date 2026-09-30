@@ -48,8 +48,16 @@ struct uidfake_args {
 #define UF_TABLE_SCAN \
 	512 /* the largest arm64 table, 64-bit or 32-bit, is ~450 */
 
-static uidfake_syscall_t *main_table;
-static uidfake_syscall_t *compat_table;
+/*
+ * One pair per mechanism, not one pair for the file: the two table mechanisms are
+ * reverted in the order the families are (the uid queries first), and a mechanism
+ * that could not find its own table would leave entries pointing into a module
+ * that is leaving.
+ */
+static uidfake_syscall_t *g_uid_table;
+static uidfake_syscall_t *g_uid_ctable;
+static uidfake_syscall_t *g_set_table;
+static uidfake_syscall_t *g_set_ctable;
 
 struct hook_entry { // NOLINT(clang-analyzer-optin.performance.Padding)
 	unsigned int nr;
@@ -453,10 +461,10 @@ static int uid_tables_install(void)
 #endif
 	);
 
-	main_table = (uidfake_syscall_t *)table;
-	n = patch_entries(main_table, g_hook, ARRAY_SIZE(g_hook), true);
+	g_uid_table = (uidfake_syscall_t *)table;
+	n = patch_entries(g_uid_table, g_hook, ARRAY_SIZE(g_hook), true);
 	if (n != ARRAY_SIZE(g_hook)) {
-		unpatch_entries(main_table, g_hook, n);
+		unpatch_entries(g_uid_table, g_hook, n);
 		return -EIO;
 	}
 	pr_info("uidfake: %u uid syscall(s) hooked in sys_call_table\n", n);
@@ -465,8 +473,8 @@ static int uid_tables_install(void)
 #ifdef CONFIG_COMPAT
 	table = uidfake_lookup("compat_sys_call_table");
 	if (table) {
-		compat_table = (uidfake_syscall_t *)table;
-		n_compat = patch_entries(compat_table, g_chook,
+		g_uid_ctable = (uidfake_syscall_t *)table;
+		n_compat = patch_entries(g_uid_ctable, g_chook,
 					 ARRAY_SIZE(g_chook), false);
 		if (n_compat != ARRAY_SIZE(g_chook))
 			n = n_compat;
@@ -481,12 +489,15 @@ static int uid_tables_install(void)
 }
 static void uid_tables_remove(void)
 {
-	if (!main_table)
+	if (!g_uid_table)
 		return;
-	unpatch_entries(main_table, g_hook, ARRAY_SIZE(g_hook));
+	unpatch_entries(g_uid_table, g_hook, ARRAY_SIZE(g_hook));
+	g_uid_table = NULL;
 #ifdef CONFIG_COMPAT
-	if (compat_table)
-		unpatch_entries(compat_table, g_chook, ARRAY_SIZE(g_chook));
+	if (g_uid_ctable) {
+		unpatch_entries(g_uid_ctable, g_chook, ARRAY_SIZE(g_chook));
+		g_uid_ctable = NULL;
+	}
 #endif
 }
 static int setuid_tables_install(void)
@@ -496,12 +507,11 @@ static int setuid_tables_install(void)
 
 	if (!table)
 		return -ENOENT;
-	if (!main_table)
-		main_table = (uidfake_syscall_t *)table;
+	g_set_table = (uidfake_syscall_t *)table;
 
-	n = patch_entries(main_table, g_set, ARRAY_SIZE(g_set), true);
+	n = patch_entries(g_set_table, g_set, ARRAY_SIZE(g_set), true);
 	if (n != ARRAY_SIZE(g_set)) {
-		unpatch_entries(main_table, g_set, n);
+		unpatch_entries(g_set_table, g_set, n);
 		pr_err("uidfake: could not hook the id setters either; identity changes are NOT watched\n");
 		return -EIO;
 	}
@@ -511,8 +521,8 @@ static int setuid_tables_install(void)
 #ifdef CONFIG_COMPAT
 	table = uidfake_lookup("compat_sys_call_table");
 	if (table) {
-		compat_table = (uidfake_syscall_t *)table;
-		c = patch_entries(compat_table, g_cset, ARRAY_SIZE(g_cset),
+		g_set_ctable = (uidfake_syscall_t *)table;
+		c = patch_entries(g_set_ctable, g_cset, ARRAY_SIZE(g_cset),
 				  false);
 		pr_info("uidfake: %u of %u 32-bit id setter(s) hooked\n", c,
 			(unsigned)ARRAY_SIZE(g_cset));
@@ -521,7 +531,7 @@ static int setuid_tables_install(void)
 	/* the counts a user reads are what is hooked: ten of ten here */
 	uidfake_status_add_hooks_expected(ARRAY_SIZE(g_set),
 #ifdef CONFIG_COMPAT
-					  compat_table ? ARRAY_SIZE(g_cset) : 0
+					  g_set_ctable ? ARRAY_SIZE(g_cset) : 0
 #else
 					  0
 #endif
@@ -532,12 +542,15 @@ static int setuid_tables_install(void)
 }
 static void setuid_tables_remove(void)
 {
-	if (!main_table)
+	if (!g_set_table)
 		return;
-	unpatch_entries(main_table, g_set, ARRAY_SIZE(g_set));
+	unpatch_entries(g_set_table, g_set, ARRAY_SIZE(g_set));
+	g_set_table = NULL;
 #ifdef CONFIG_COMPAT
-	if (compat_table)
-		unpatch_entries(compat_table, g_cset, ARRAY_SIZE(g_cset));
+	if (g_set_ctable) {
+		unpatch_entries(g_set_ctable, g_cset, ARRAY_SIZE(g_cset));
+		g_set_ctable = NULL;
+	}
 #endif
 }
 

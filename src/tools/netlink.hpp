@@ -55,7 +55,8 @@ public:
    * loaded was built before the command existed. */
   [[nodiscard]] bool unsupported() const { return unsupported_; }
 
-  /* Replaces the kernel's caller-apk inode table (an empty list clears it). */
+  /* Applies caller-APK inode deltas. Removal needs explicit action=1 entries;
+   * an empty list has no effect on the kernel's existing records. */
   [[nodiscard]] bool push_apks(std::span<const ApkEntry> entries);
 
   /* One staged upload: begin, pages of at most kPageBytes, commit. */

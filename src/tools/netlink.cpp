@@ -360,6 +360,12 @@ bool NetlinkClient::send_command(std::uint8_t cmd,
 }
 
 bool NetlinkClient::send_paged(std::span<const Pair> pairs) {
+  /* The published staging protocol requires a nonempty blob. A reserved
+   * system-UID pair is discarded by policy_apply, so it replaces the current
+   * policy with an empty one without changing the kernel wire protocol. */
+  const Pair empty_policy{0, 0};
+  if (pairs.empty())
+    pairs = std::span<const Pair>(&empty_policy, 1);
   const auto total = static_cast<std::uint32_t>(pairs.size());
 
   if (!send_command(KAUX_CMD_STAGE_BEGIN,
@@ -436,17 +442,19 @@ bool NetlinkClient::push_apks(std::span<const ApkEntry> entries) {
     }
   }
 
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    if (send_staged(KAUX_KIND_APKS, blob)) {
-      note_reachable();
-      return true;
-    }
-    family_.reset();
-    socket_.reset();
+  if (send_staged(KAUX_KIND_APKS, blob)) {
+    note_reachable();
+    return true;
   }
+  /* A lost COMMIT reply does not mean the inode operations did not run.
+   * Let Syncer reconcile its per-inode ledger instead of blindly replaying
+   * a delta that might retire a replacement it just installed. */
+  family_.reset();
+  socket_.reset();
   if (!warned_) {
     warned_ = true;
-    Log::warn("kernel side unreachable, caller apk table unchanged");
+    Log::warn(
+        "kernel side unreachable, caller apk update needs reconciliation");
     report_status("kernel unreachable");
   }
   return false;

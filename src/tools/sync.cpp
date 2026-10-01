@@ -13,7 +13,6 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <utility>
 
 #include "common.hpp"
@@ -23,7 +22,6 @@
 namespace uidfake {
 namespace {
 
-/* Where installed code lives; the same root the watcher reports events from. */
 constexpr std::string_view kAppRoot = "/data/app";
 /* The kernel takes this many caller code dirs. */
 constexpr std::size_t kApkLimit = 10000;
@@ -146,6 +144,9 @@ const PackageDb *Syncer::packages() {
   if (!db)
     return nullptr;
   Log::info("read {} ({} package(s))", kPackagesXml, db->by_name().size());
+  /* Directory events may have identified a caller's replacement APK before
+   * this database commit. Only a new, readable snapshot supersedes the hint. */
+  code_dirs_.clear();
   packages_ = std::move(db);
   packages_stamp_ = stamp;
   return &*packages_;
@@ -201,6 +202,7 @@ Syncer::open_rules(const std::filesystem::path &file,
 }
 
 void Syncer::sync_now(std::string_view why) {
+  sync_ok_ = false;
   const std::optional<RuleSource> source = RuleSource::active(sources_);
   if (!source) {
     /* Once per outage: before the unlock this used to repeat on every tick. */
@@ -209,6 +211,7 @@ void Syncer::sync_now(std::string_view why) {
       Log::warn("no readable rule source yet (keeping the previous policy)");
       report_status("waiting for an HMA config");
     }
+    watcher_.arm_retry();
     return;
   }
   if (config_refused_) {
@@ -217,11 +220,15 @@ void Syncer::sync_now(std::string_view why) {
   }
 
   const PackageDb *packages = this->packages();
-  if (packages == nullptr)
+  if (packages == nullptr) {
+    watcher_.arm_retry();
     return;
+  }
   const auto file = source->config();
-  if (!file)
+  if (!file) {
+    watcher_.arm_retry();
     return; /* it went away between the check and the read */
+  }
 
   const auto users = android_users();
   if (!users) {
@@ -238,8 +245,10 @@ void Syncer::sync_now(std::string_view why) {
   }
 
   const auto opened = open_rules(*file, *packages);
-  if (!opened)
+  if (!opened) {
+    watcher_.arm_retry();
     return;
+  }
   Rules *rules = opened->rules.get();
   const Presets &presets = opened->presets;
   Pairs pairs = rules->expand(*packages, presets);
@@ -270,7 +279,9 @@ void Syncer::sync_now(std::string_view why) {
   const auto same_pair = [](const Pair &a, const Pair &b) {
     return a.caller == b.caller && a.target == b.target;
   };
-  if (!std::ranges::equal(pairs, pushed_, same_pair)) {
+  /* A new daemon does not know what the already loaded module holds. In
+   * particular an empty config must clear a policy left by its predecessor. */
+  if (!policy_pushed_ || !std::ranges::equal(pairs, pushed_, same_pair)) {
     if (!netlink_.push(pairs)) {
       /* The kernel keeps its policy, and this pass
        * asks for a retry: a module loaded a second
@@ -280,6 +291,7 @@ void Syncer::sync_now(std::string_view why) {
       return;
     }
     pushed_.assign(pairs.begin(), pairs.end());
+    policy_pushed_ = true;
     Log::info("synced {} pair(s) ({})", pairs.size(), why);
     report_status(status_line(netlink_, pairs.size()));
   }
@@ -299,23 +311,27 @@ void Syncer::sync_now(std::string_view why) {
       callers_.emplace(name, info.uid);
   }
 
+  /* packages() clears old paths when a new database snapshot is read. With
+   * the same snapshot, preserve early caller-directory hints across retries
+   * and unrelated config events until PackageManager commits. */
   std::size_t missing = 0;
-  for (const auto &[name, uid] : callers_) {
+  for (const auto &[name, info] : packages->by_name()) {
     const auto dir = packages->code_dir_of(name);
     if (!dir) {
-      ++missing;
+      if (callers_.contains(name))
+        ++missing;
       continue;
     }
-    code_dirs_.insert_or_assign(name, *dir);
+    code_dirs_.try_emplace(name, *dir);
   }
   if (missing != 0)
     Log::warn("{} caller(s) have no code directory in {}", missing,
               kPackagesXml);
 
-  publish_code_dirs();
+  sync_ok_ = publish_code_dirs();
 }
 
-void Syncer::publish_code_dirs() {
+bool Syncer::publish_code_dirs() {
   std::vector<ApkEntry> entries;
   entries.reserve(callers_.size());
   /* One entry per directory, even when several packages share a uid. */
@@ -354,18 +370,17 @@ void Syncer::publish_code_dirs() {
     if (dir == code_dirs_.end())
       continue;
     /*
-     * Only the tree installed code lives in. An entry on another partition --
-     * a system app's apk, a library under /apex -- puts that whole filesystem
-     * into the kernel's set, and then any file the framework reads from it ends
-     * a child's wait long before its own code is anywhere near running.
-     */
-    /*
      * The file a child opens first is its own base.apk, and that is the inode
      * whose open the kernel replaces, so the path to it is what goes up. A
      * system app's apk is under /system, an installed one's under /data; both
      * are files with an inode, and which partition it is on no longer matters.
      */
-    const auto apk = dir->second / "base.apk";
+    /* packages.xml also carries a direct Foo.apk path for system packages.
+     * Such a path must not become Foo.apk/base.apk. */
+    std::error_code ec;
+    const auto apk = std::filesystem::is_regular_file(dir->second, ec)
+                         ? dir->second
+                         : dir->second / "base.apk";
     if (!seen.insert(apk.string()).second)
       continue;
     struct stat info{};
@@ -379,85 +394,117 @@ void Syncer::publish_code_dirs() {
                                .ino = static_cast<std::uint64_t>(info.st_ino)});
   }
 
-  /*
-   * What goes up is the difference, and only the difference: an apk that is new
-   * or was replaced (same path, another inode -- an update), and one that is
-   * gone (the path is no longer there, so it is named by its numbers). The
-   * whole set would not fit one message on a device with many apps anyway.
-   */
-  /* The difference is taken through hash sets. Both loops below used to scan
-   * the whole published set for every entry -- quadratic, which is a tenth of a
-   * millisecond on a device with three hundred apps and a stall of up to a
-   * second on one at the ten thousand apk limit, on every package event. */
-  const auto key_of = [](const ApkEntry &entry) {
-    return entry.path + '\0' + std::to_string(entry.dev) + '\0' +
-           std::to_string(entry.ino);
+  const auto id_of = [](const ApkEntry &entry) {
+    return ApkId{entry.dev, entry.ino};
   };
-  std::unordered_set<std::string> known, paths, was_known;
-  known.reserve(entries.size());
-  paths.reserve(entries.size());
-  was_known.reserve(published_.size());
-  for (const auto &entry : entries) {
-    known.insert(key_of(entry));
-    paths.insert(entry.path);
-  }
-  for (const auto &old : published_)
-    was_known.insert(key_of(old));
+  std::map<ApkId, ApkEntry> desired;
+  for (const auto &entry : entries)
+    desired.try_emplace(id_of(entry), entry);
 
-  std::vector<ApkEntry> delta;
-  for (const auto &entry : entries) {
-    if (!was_known.contains(key_of(entry)))
-      delta.push_back(entry);
+  bool recovering = false;
+  std::vector<ApkEntry> drops;
+  for (auto &[id, old] : published_) {
+    recovering |= old.phase == ApkPhase::Adding;
+    const auto want = desired.find(id);
+    if (old.phase == ApkPhase::Dropping || want == desired.end() ||
+        want->second.uid != old.entry.uid) {
+      auto entry = old.entry;
+      entry.action = 1;
+      drops.push_back(std::move(entry));
+      old.phase = ApkPhase::Dropping;
+    }
   }
-  for (const auto &old : published_) {
-    if (!paths.contains(old.path))
-      delta.push_back(ApkEntry{.path = old.path,
-                               .uid = old.uid,
-                               .dev = old.dev,
-                               .ino = old.ino,
-                               .action = 1});
+  /* Drops and adds are separate batches. A valid drop cannot fail per entry;
+   * its ACK confirms absence. If the reply is lost, repeat only drops before
+   * any add: replaying a mixed batch could park its own newly installed UID. */
+  if (!drops.empty()) {
+    if (!netlink_.push_apks(drops)) {
+      watcher_.arm_retry();
+      return false;
+    }
+    for (const auto &entry : drops)
+      published_.erase(id_of(entry));
   }
-  Log::info("registered {} app apk(s), {} change(s) to send", entries.size(),
-            delta.size());
-  if (delta.empty())
-    return;
-  if (!netlink_.push_apks(delta)) {
+
+  std::vector<ApkEntry> adds;
+  for (const auto &[id, entry] : desired) {
+    const auto have = published_.find(id);
+    if (have == published_.end() || have->second.phase == ApkPhase::Adding)
+      adds.push_back(entry);
+  }
+  Log::info("registered {} app apk(s), {} change(s) to send", desired.size(),
+            drops.size() + adds.size());
+  if (drops.empty() && adds.empty())
+    return true;
+
+  enum class AddResult { Complete, Failed, Unreachable };
+  const auto add = [&](std::span<const ApkEntry> batch) {
+    /* Record possible effects before sending, including a commit whose ACK
+     * is lost. A desired-set rollback must still retire these identities. */
+    for (const auto &entry : batch)
+      published_.insert_or_assign(id_of(entry),
+                                  PublishedApk{entry, ApkPhase::Adding});
+    if (!netlink_.push_apks(batch))
+      return AddResult::Unreachable;
+    const auto st = netlink_.status();
+    if (!st || st->apk_offered != batch.size())
+      return AddResult::Unreachable;
+    if (st->apk_failed)
+      return AddResult::Failed;
+    for (const auto &entry : batch)
+      published_.at(id_of(entry)).phase = ApkPhase::Confirmed;
+    return AddResult::Complete;
+  };
+
+  bool complete = true;
+  bool reachable = true;
+  if (recovering) {
+    /* A failed batch says nothing about which additions succeeded. Re-adds
+     * are idempotent after their drop barrier; confirm them individually so
+     * one bad inode does not keep every successful entry in the retry set. */
+    for (const auto &entry : adds) {
+      const auto result = add(std::span<const ApkEntry>(&entry, 1));
+      if (result != AddResult::Complete)
+        complete = false;
+      if (result == AddResult::Unreachable) {
+        reachable = false;
+        break;
+      }
+    }
+  } else if (!adds.empty()) {
+    const auto result = add(adds);
+    complete = result == AddResult::Complete;
+    reachable = result != AddResult::Unreachable;
+  }
+  if (!complete)
     watcher_.arm_retry();
-    return;
-  }
-  published_.assign(entries.begin(), entries.end());
   /* the apk side moved, so the line a user reads has to move with it */
-  report_status(status_line(netlink_, pushed_.size()));
+  if (reachable) {
+    auto line = status_line(netlink_, pushed_.size());
+    if (!complete)
+      line += ", apk retry pending";
+    report_status(line);
+  } else {
+    report_status("kernel unreachable, apk update pending");
+  }
+  return complete;
 }
 
 void Syncer::handle_packages(const std::vector<std::string> &dirs) {
-  /* Nothing is known before the first policy
-   * arrives, and a policy change reads the whole map
-   * again anyway. */
-  if (callers_.empty())
-    return;
+  /* A new target or a reassigned UID changes rules as well as APK paths.
+   * The packages.xml watch repeats this after PackageManager commits if the
+   * directory event arrived before its database update. */
+  sync_now("packages changed");
 
-  /*
-   * Every install, update and removal changes which base.apk files exist, and
-   * the set of those the kernel holds is what names a child -- so all of these
-   * events have to reach publish_code_dirs(), not only the ones about a caller.
-   * The paths come from the package database, so read it again first: its stamp
-   * is what tells installs apart from noise.
-   */
-  if (this->packages() == nullptr)
-    return;
-
+  /* Preserve the early path for known callers: their replacement directory can
+   * appear before PackageManager commits its new codePath. Its UID is already
+   * known, so register that APK as soon as the directory event exposes it. */
   bool changed = false;
   for (const auto &name : dirs) {
-    /* Every event, including the ones about a package that is not a caller: its
-     * apk still has to be in the kernel's set, so it is worth seeing. */
     Log::info("package event: {}", name);
-    changed = true;
-    const std::filesystem::path base = std::filesystem::path{kAppRoot} / name;
+    const auto base = std::filesystem::path{kAppRoot} / name;
     std::error_code ec;
-
     if (std::filesystem::is_directory(base, ec)) {
-
       for (const auto &entry : std::filesystem::directory_iterator{base, ec}) {
         if (ec)
           break;
@@ -469,15 +516,12 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
         });
         if (caller == callers_.end())
           continue;
-        Log::info("{} now lives in {}", caller->first, entry.path().string());
         code_dirs_.insert_or_assign(caller->first, entry.path());
         changed = true;
       }
     } else {
-
       for (auto it = code_dirs_.begin(); it != code_dirs_.end();) {
         if (it->second.parent_path() == base) {
-          Log::info("{} no longer lives in {}", it->first, it->second.string());
           it = code_dirs_.erase(it);
           changed = true;
         } else {
@@ -486,9 +530,8 @@ void Syncer::handle_packages(const std::vector<std::string> &dirs) {
       }
     }
   }
-
-  if (changed)
-    publish_code_dirs();
+  if (changed && !publish_code_dirs())
+    sync_ok_ = false;
 }
 
 /* One decision, printed with everything it was read
@@ -674,14 +717,13 @@ void Syncer::template_for(std::string_view caller, bool write) {
 }
 
 bool Syncer::run() {
+  /* Open retry timers before the first attempt, so a startup failure cannot
+   * lose its retry while the config watches are already complete. */
+  if (!config_.once && !watcher_.open(sources_))
+    return false;
   sync_now();
   if (config_.once)
-    return !users_refused_;
-
-  if (!watcher_.open(sources_))
-    return false;
-  if (users_refused_)
-    watcher_.arm_retry();
+    return sync_ok_;
   if (const auto active = RuleSource::active(sources_)) {
     if (const auto file = active->config())
       Log::info("watching {}", file->string());

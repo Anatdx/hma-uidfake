@@ -72,8 +72,8 @@ private:
   void handle_packages(const std::vector<std::string> &dirs);
   [[nodiscard]] const PackageDb *packages();
 
-  /* stat() every caller's code directory and push the result. */
-  void publish_code_dirs();
+  /* Publish the current APK delta; false leaves it pending for a retry. */
+  [[nodiscard]] bool publish_code_dirs();
 
   /* Where a config can be. Not a command line option: this reads where the apps
    * keep them. */
@@ -90,6 +90,8 @@ private:
   PackageStamp packages_stamp_;
   bool config_refused_ = false;
   bool users_refused_ = false;
+  bool policy_pushed_ = false;
+  bool sync_ok_ = false;
   NetlinkClient netlink_;
   Watcher watcher_;
   /* The callers of the current policy: package name -> uid, and where their
@@ -98,7 +100,16 @@ private:
   std::map<std::string, std::filesystem::path, std::less<>> code_dirs_;
 
   std::vector<Pair> pushed_;
-  std::vector<ApkEntry> published_;
+  using ApkId = std::pair<std::uint32_t, std::uint64_t>;
+  enum class ApkPhase { Confirmed, Adding, Dropping };
+  struct PublishedApk {
+    ApkEntry entry;
+    ApkPhase phase = ApkPhase::Adding;
+  };
+  /* A command can take effect even if its reply is lost. Adding means the
+   * identity may be installed; Dropping must finish before another add for
+   * that inode. Neither uncertainty may be discarded on a config change. */
+  std::map<ApkId, PublishedApk> published_;
 };
 
 } // namespace uidfake

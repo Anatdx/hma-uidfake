@@ -126,7 +126,7 @@ void Watcher::apply_watches() {
   }
 
   std::vector<Watch> fresh;
-  fresh.reserve(wants.size() + 1);
+  fresh.reserve(wants.size() + 3);
   for (const auto &want : wants)
     fresh.push_back(Watch{.path = want.path,
                           .mask = want.kind == RuleSource::Watch::Kind::File
@@ -140,6 +140,31 @@ void Watcher::apply_watches() {
                         .filter = {},
                         .app_root = true,
                         .warned = was_warned(kAppRoot)});
+  /* PackageManager installs its database with an atomic rename. Watching the
+   * parent catches the committed UID/code-path map after /data/app events,
+   * including a new target that previously expanded to no policy pairs. */
+  const auto system = std::filesystem::path{kPackagesXml}.parent_path();
+  const auto existing = std::ranges::find_if(
+      fresh, [&](const Watch &watch) { return watch.path == system; });
+  if (existing != fresh.end()) {
+    /* HMA-OSS may already watch this parent for its config directory. A
+     * second inotify_add_watch returns the same wd, so merge its filters. */
+    existing->mask |= kDirEvents;
+    if (!existing->filter.empty())
+      existing->filter.emplace_back("packages.xml");
+  } else {
+    fresh.push_back(Watch{.path = system,
+                          .mask = kDirEvents,
+                          .filter = {"packages.xml"},
+                          .app_root = false,
+                          .warned = was_warned(system)});
+  }
+  const auto users = system / "users";
+  fresh.push_back(Watch{.path = users,
+                        .mask = kAppDirEvents,
+                        .filter = {},
+                        .app_root = false,
+                        .warned = was_warned(users)});
   desired_ = std::move(fresh);
   for (const auto &want : desired_)
     add(want);

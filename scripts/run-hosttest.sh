@@ -58,10 +58,11 @@ clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wda
 "$packages_xml"
 
 # The inline hook's runtime half: a real kernel function (find_user, taken from a
-# device image) is relocated here, and the entry patch is decoded back.
+# device image) is relocated here, and short trampoline prefixes, native resume
+# targets and refusals are checked alongside the entry patch.
 inline=build/inline_reloc_test
-clang -std=c23 -O1 -Wall -Wextra -Wno-unused-function -I src -I scripts -o "$inline" \
-  scripts/inline_reloc_test.c src/inline.c
+clang -std=c23 -O1 -Wall -Wextra -Wno-unused-function -I src -I src/include -I scripts -o "$inline" \
+  scripts/inline_reloc_test.c src/inline.c src/inline_entry.c
 "$inline"
 
 # The fallback chains: the real tiers.c with a table of fakes, so that order,
@@ -94,7 +95,8 @@ clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wal
   -Wdouble-promotion -Wformat=2 -I src/tools -o "$packages_xml" scripts/packages_xml_test.cpp \
   src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
 clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -Wall -Wextra \
-  -Wno-unused-function -I src -I scripts -o "$inline" scripts/inline_reloc_test.c src/inline.c
+  -Wno-unused-function -I src -I src/include -I scripts -o "$inline" \
+  scripts/inline_reloc_test.c src/inline.c src/inline_entry.c
 clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -Wall -Wextra \
   -DUIDFAKE_HOST_TEST -I src -I src/include -I scripts/hosttest -o "$tiers" \
   scripts/tiers_test.c

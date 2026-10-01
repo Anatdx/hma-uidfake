@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Host test for the runtime relocator in src/inline.c. The input is the real
- * machine code of find_user() from a device kernel image, so the encodings under
- * test are the ones a kernel actually emits: paciasp, a shadow-call-stack store,
- * two adrp+add pairs, three bl calls, and branches that stay inside the function.
+ * Host test for the runtime relocator and short entry trampoline. Real machine
+ * code of find_user() exercises PAC, SCS, ADRP+ADD, calls and internal branches.
+ * Synthetic entries cover short trampoline prefixes and refusal paths.
  */
 #include "include/inline.h"
+#include "include/inline_entry.h"
 
 #ifdef UF_INLINE_DEBUG
 extern unsigned int uf_inline_dbg_insn;
@@ -98,6 +98,107 @@ static int contains_word(const unsigned char *code, size_t len,
 			return 1;
 	}
 	return 0;
+}
+
+static unsigned long branch_target(unsigned int word, unsigned long pc)
+{
+	long displacement = word & 0x03ffffffu;
+
+	if (displacement & (1L << 25))
+		displacement -= 1L << 26;
+	return pc + (unsigned long)(displacement * 4);
+}
+
+static void trampoline_refused(const unsigned int *source, size_t len,
+			       size_t skip, unsigned long to, size_t capacity,
+			       int expected, const char *what)
+{
+	unsigned int output[4], before[4];
+	size_t written = 999;
+
+	memset(output, 0xa5, sizeof(output));
+	memcpy(before, output, sizeof(before));
+	check(uf_inline_trampoline(output, capacity, source, FROM_VA, to, len,
+				   skip, &written) == expected,
+	      what);
+	check(written == 0 && !memcmp(output, before, sizeof(output)),
+	      "trampoline refusal clears length and leaves output untouched");
+}
+
+static void trampoline_tests(void)
+{
+	static const struct {
+		unsigned int first, second;
+		size_t skip;
+	} entries[] = {
+		{ 0x51000448, 0x7100091f, 0 }, /* SUB; CMP, plain entry */
+		{ 0xd503233f, 0xa9bd7bfd, 4 }, /* PACIASP; STP frame */
+		{ 0xd503237f, 0xf800865e, 4 }, /* PACIBSP; SCS push */
+		{ 0xd503245f, 0x51000448, 4 }, /* BTI c; SUB */
+		{ 0xd50324df, 0xd503233f, 4 }, /* BTI jc; PACIASP */
+	};
+	/* At source[2], each PC-relative target below reaches source[1]. */
+	static const unsigned int reentries[] = {
+		0x17ffffff, 0x97ffffff, 0x54ffffe0, /* B, BL, B.eq */
+		0x34ffffe0, 0x3607ffe0, 0x10ffffe0, /* CBZ, TBZ, ADR */
+		0x90000000, /* ADRP: the entry's page */
+		0xd61f0100, 0xd63f0100, /* BR/BLR: unresolved target */
+	};
+	unsigned int source[4], output[4];
+	size_t i, written;
+
+	for (i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+		const size_t prefix = entries[i].skip + 4;
+		const size_t branch = prefix / 4;
+
+		source[0] = entries[i].first;
+		source[1] = entries[i].second;
+		source[2] = 0x14000000; /* Body-only loop stays native. */
+		source[3] = 0xd65f03c0;
+		memset(output, 0xa5, sizeof(output));
+		written = 999;
+		check(uf_inline_trampoline(output, sizeof(output), source,
+					   FROM_VA, TO_VA, sizeof(source),
+					   entries[i].skip, &written) == 0,
+		      "plain and BTI/PAC entries build a short trampoline");
+		/* This checks PAC instruction preservation, not hardware authentication. */
+		check(written == prefix + 4 && !memcmp(output, source, prefix),
+		      "original-call trampoline replays the complete entry prefix");
+		check((output[branch] & 0xfc000000u) == 0x14000000u &&
+			      branch_target(output[branch], TO_VA + prefix) ==
+				      FROM_VA + prefix,
+		      "direct return branch resumes after the overwritten instruction");
+		check(output[branch + 1] == 0xa5a5a5a5,
+		      "trampoline does not copy the native body");
+		trampoline_refused(source, sizeof(source), entries[i].skip,
+				   FROM_VA + (1UL << 28), sizeof(output),
+				   UF_INLINE_ERANGE,
+				   "out-of-range native resume is refused");
+		trampoline_refused(
+			source, sizeof(source), entries[i].skip, TO_VA, prefix,
+			UF_INLINE_ESIZE,
+			"output must fit the prefix and resume branch");
+		trampoline_refused(source, sizeof(source), entries[i].skip ^ 4,
+				   TO_VA, sizeof(output), UF_INLINE_EINSN,
+				   "patch offset must match the entry landing");
+	}
+	source[0] = 0xd503245f; /* BTI c */
+	source[1] = 0x51000448; /* SUB w8,w2,#1 */
+	for (i = 0; i < sizeof(reentries) / sizeof(reentries[0]); i++) {
+		source[2] = reentries[i];
+		trampoline_refused(
+			source, sizeof(source), 4, TO_VA, sizeof(output),
+			UF_INLINE_EINSN,
+			"prefix reentry or unresolved body branch is refused");
+	}
+	source[2] = 0xd503201f;
+	source[1] = 0x14000000;
+	trampoline_refused(source, sizeof(source), 4, TO_VA, sizeof(output),
+			   UF_INLINE_EINSN,
+			   "an existing branch at the patch site is refused");
+	source[1] = 0x51000448;
+	trampoline_refused(source, 8, 4, TO_VA, sizeof(output), UF_INLINE_ESIZE,
+			   "a trampoline needs a native body to resume");
 }
 
 int main(void)
@@ -206,6 +307,7 @@ int main(void)
 		      "a hook out of branch range is refused");
 	}
 
+	trampoline_tests();
 	if (failures == 0)
 		printf("inline reloc: PASS\n");
 	return failures == 0 ? 0 : 1;

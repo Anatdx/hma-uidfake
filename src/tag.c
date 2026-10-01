@@ -195,15 +195,21 @@ static noinline void uidfake_tag_group(u32 tag)
 
 	rcu_read_lock();
 	for_each_thread(current, t) {
-		const unsigned long flags =
-			READ_ONCE(task_thread_info(t)->flags);
-		const unsigned long next =
-			(flags &
-			 ~((UF_TAG_MASK << UF_TAG_SHIFT) | UF_TAG_PENDING)) |
-			((unsigned long)tag << UF_TAG_SHIFT);
+		unsigned long *p = (unsigned long *)&task_thread_info(t)->flags;
+		unsigned long old, next;
 
-		if (next != flags)
-			WRITE_ONCE(task_thread_info(t)->flags, next);
+		/* A concurrent close or successful naming settles this thread.
+		 * Recheck after every CAS failure, and preserve unrelated TIF bits
+		 * changed by the scheduler or another module in the same word.
+		 * Group propagation remains per-thread, not one atomic group update.
+		 */
+		do {
+			old = READ_ONCE(*p);
+			if (!(old & UF_TAG_PENDING) ||
+			    (old & (UF_TAG_MASK << UF_TAG_SHIFT)))
+				break;
+			next = (old & ~UF_TAG_CLEAR) | UF_TAG_SET(tag);
+		} while (cmpxchg(p, old, next) != old);
 	}
 	rcu_read_unlock();
 }
@@ -213,6 +219,8 @@ static noinline void uidfake_tag_verify(u32 tag)
 	if (!uidfake_tag_pending())
 		return;
 	uidfake_tag_group(tag);
+	if (uf_ti_tag(current) != tag)
+		return; /* A concurrent close or another naming won this thread. */
 	pr_info("uidfake: iso uid %u belongs to app %u, from the apk it opened\n",
 		(u32)__kuid_val(current_fsuid()), (u32)tag - 1u + UF_APP_MIN);
 }

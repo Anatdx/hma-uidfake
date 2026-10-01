@@ -129,7 +129,8 @@ static struct uid_hash g_hash = { .bits = 7, .shift = 25, .multiply = false };
 static u32 uid_hash_apply(const struct uid_hash *h, u32 uid)
 {
 	if (h->multiply)
-		return (u32)(((u64)uid * UID_HASH_GOLDEN) >> h->shift);
+		/* hash_32 truncates the product before extracting its high bits. */
+		return (u32)(uid * UID_HASH_GOLDEN) >> h->shift;
 
 	return ((uid >> h->bits) + uid) & ((1u << h->bits) - 1);
 }
@@ -491,7 +492,8 @@ static int layout_targets(struct layout *l, struct apply_pair *p, u32 n,
 	hsize = 16;
 	while (hsize < (u32)n * 2u && hsize < (1u << 17))
 		hsize <<= 1;
-	masks = kcalloc((size_t)n * l->nmask_words + 1u, sizeof(*masks),
+	/* Slot zero is a complete empty mask, including every caller word. */
+	masks = kcalloc(((size_t)n + 1u) * l->nmask_words, sizeof(*masks),
 			GFP_KERNEL);
 	if (g_scratch == NULL)
 		g_scratch = kcalloc(POLICY_MAX_CALLERS / 64 + 1u,
@@ -647,6 +649,14 @@ void policy_apply(const u32 *pairs, u32 npairs)
 		n++;
 	}
 
+	/* No target remains after filtering: publish the existing empty snapshot.
+	 * The target builder requires at least one target before interning a mask. */
+	if (!n) {
+		policy_publish(&g_empty);
+		pr_info("uidfake: cleared policy\n");
+		goto out;
+	}
+
 	if (n) {
 		struct uid_hash h;
 
@@ -795,7 +805,7 @@ static u32 policy_hash(u32 caller, u32 target, u32 shift)
 static u32 policy_bucket(u32 target, u32 bits, u32 multiply)
 {
 	u32 hfn = ((target >> bits) + target) & ((1u << bits) - 1);
-	u32 h32 = (u32)(((u64)target * UID_HASH_GOLDEN) >> (32 - bits));
+	u32 h32 = (u32)(target * UID_HASH_GOLDEN) >> (32 - bits);
 	u32 sel = (u32)0 - multiply;
 
 	return (hfn & ~sel) | (h32 & sel);

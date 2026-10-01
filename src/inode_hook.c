@@ -304,14 +304,13 @@ int uidfake_apk_apply(const u32 *blob, u32 len)
 		inode = igrab(d_backing_inode(p.dentry));
 		path_put(&p);
 		if (inode != NULL && UF_DEBUG_ON())
-			pr_info("uidfake: apk probe %s: state=%#lx new=%d count=%d dev=%u ino=%lu size=%lld parent=%s\n",
+			pr_info("uidfake: apk probe %s: state=%#lx new=%d count=%d dev=%u ino=%lu size=%lld\n",
 				path, (unsigned long)inode->i_state,
 				!!(inode->i_state & I_NEW),
 				atomic_read(&inode->i_count),
 				(unsigned int)uf_encode_dev(inode->i_sb->s_dev),
 				(unsigned long)inode->i_ino,
-				(long long)i_size_read(inode),
-				p.dentry->d_parent->d_name.name);
+				(long long)i_size_read(inode));
 		if (inode != NULL)
 			iput(inode);
 	}

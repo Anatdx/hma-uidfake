@@ -55,6 +55,9 @@ static int __init uidfake_init(void)
 	uidfake_debug_init(uidfake_debug);
 
 	netlink_init();
+	/* An inline tier may pin this module and publish a kernel entry below.
+	 * Module-loader failure frees even pinned modules: no error return after
+	 * this point. Individual unsupported tiers report their own status. */
 	pr_info("uidfake: ready (%d hook(s))\n", hooks_install());
 	return 0;
 }

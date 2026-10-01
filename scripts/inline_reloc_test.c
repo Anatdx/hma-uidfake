@@ -20,6 +20,7 @@ extern unsigned int uf_inline_dbg_stage;
 #include "find_user_sample.h"
 
 #define FROM_VA 0x17986cUL
+#define TO_VA 0x8000000UL
 #define LEN 248u
 
 static int failures;
@@ -32,37 +33,53 @@ static void check(int ok, const char *what)
 	}
 }
 
-/* Materialise the movz/movk runs in @code and report whether x@reg ever holds @value. */
+/* Decode the relocated ADRP+ADD pairs and direct calls at their new PCs. */
 static int holds_const(const unsigned char *code, size_t len, unsigned int reg,
 		       unsigned long value)
+{
+	unsigned long page = 0;
+	int have_page = 0;
+	size_t i;
+
+	for (i = 0; i + 4 <= len; i += 4) {
+		unsigned int word;
+		long offset;
+
+		memcpy(&word, code + i, 4);
+		if ((word & 0x9f00001fu) == (0x90000000u | reg)) {
+			offset = ((word >> 29) & 3u) |
+				 (((word >> 5) & 0x7ffffu) << 2);
+			if (offset & (1L << 20))
+				offset -= 1L << 21;
+			page = ((TO_VA + i) & ~0xfffUL) +
+			       (unsigned long)(offset * 4096);
+			have_page = 1;
+		} else if (have_page &&
+			   (word & 0xffc003ffu) ==
+				   (0x91000000u | reg << 5 | reg) &&
+			   page + ((word >> 10) & 0xfffu) == value) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int calls_target(const unsigned char *code, size_t len,
+			unsigned long target)
 {
 	size_t i;
 
 	for (i = 0; i + 4 <= len; i += 4) {
-		unsigned long acc = 0;
-		int started = 0;
-		size_t j;
+		unsigned int word;
+		long offset;
 
-		for (j = i; j + 4 <= len; j += 4) {
-			unsigned int insn;
-
-			memcpy(&insn, code + j, 4);
-			if ((insn & 0xff80001fu) == (0xd2800000u | reg)) {
-				acc = (insn >> 5) & 0xffffu;
-				started = 1;
-				continue;
-			}
-			if ((insn & 0xff80001fu) == (0xf2800000u | reg) &&
-			    started) {
-				const unsigned int hw = (insn >> 21) & 0x3u;
-
-				acc = (acc & ~(0xffffUL << (16 * hw))) |
-				      (((insn >> 5) & 0xffffUL) << (16 * hw));
-				continue;
-			}
-			break;
-		}
-		if (started && acc == value)
+		memcpy(&word, code + i, 4);
+		if ((word & 0xfc000000u) != 0x94000000u)
+			continue;
+		offset = word & 0x03ffffffu;
+		if (offset & (1L << 25))
+			offset -= 1L << 26;
+		if (TO_VA + i + (unsigned long)(offset * 4) == target)
 			return 1;
 	}
 	return 0;
@@ -85,13 +102,15 @@ static int contains_word(const unsigned char *code, size_t len,
 
 int main(void)
 {
-	unsigned char copy[1024];
+	_Alignas(4) unsigned char copy[1024];
+	unsigned int source[LEN / 4];
 	size_t out = 0;
 	int rc;
 
 	memset(copy, 0, sizeof copy);
-	rc = uf_inline_relocate(copy, sizeof copy, kFindUser, FROM_VA,
-				0xffff000000000000UL, LEN, &out);
+	memcpy(source, kFindUser, LEN);
+	rc = uf_inline_relocate(copy, sizeof copy, source, FROM_VA, TO_VA, LEN,
+				&out);
 	if (rc != 0) {
 #ifdef UF_INLINE_DEBUG
 		printf("  relocation returned %d (stage %u, index %u, insn 0x%08x)\n",
@@ -143,15 +162,15 @@ int main(void)
 	check(holds_const(copy, out, 9, 0x20cd868UL),
 	      "uidhash_table address kept (x9)");
 
-	check(holds_const(copy, out, 17, 0x140a024UL), "call 1 target kept");
-	check(holds_const(copy, out, 17, 0x140a278UL), "call 2 target kept");
-	check(holds_const(copy, out, 17, 0x774b70UL), "call 3 target kept");
-	check(contains_word(copy, out, 0xd63f0220u), "blr x17 emitted");
+	check(calls_target(copy, out, 0x140a024UL), "call 1 target kept");
+	check(calls_target(copy, out, 0x140a278UL), "call 2 target kept");
+	check(calls_target(copy, out, 0x774b70UL), "call 3 target kept");
+	check(!contains_word(copy, out, 0xd63f0220u), "calls remain direct");
 
 	{
 		static const unsigned int literal[2] = { 0x58000040u,
 							 0xd65f03c0u };
-		unsigned char buf[64];
+		unsigned int buf[16];
 
 		rc = uf_inline_relocate(buf, sizeof buf, literal, FROM_VA, 0, 8,
 					&out);
@@ -160,7 +179,7 @@ int main(void)
 	{
 		static const unsigned int none[2] = { 0xd65f03c0u,
 						      0xd65f03c0u };
-		unsigned char buf[64];
+		unsigned int buf[16];
 
 		rc = uf_inline_relocate(buf, sizeof buf, none, FROM_VA, 0, 8,
 					&out);
@@ -168,30 +187,23 @@ int main(void)
 	}
 
 	{
-		unsigned char patch[UF_INLINE_ENTRY];
-		unsigned int w[3];
-		long imm21;
-		/* A VA39 kernel: the image is high, the module region a few tens of
-		 * MB below it, which is what makes adrp reach and ldr literal not. */
+		unsigned int patch;
+		long imm26;
 		unsigned long site = 0xffffff8008000000UL + 0x17986cUL;
-		unsigned long hook = 0xffffff8000001000UL;
+		unsigned long hook = site - (1UL << 26);
 
-		rc = uf_inline_entry(patch, sizeof patch, site, hook);
+		rc = uf_inline_entry(&patch, sizeof patch, site, hook);
 		check(rc == (int)UF_INLINE_ENTRY, "an entry patch is built");
-		memcpy(w, patch, sizeof w);
-		check((w[0] & 0x9f000000u) == 0x90000000u, "adrp first");
-		check(w[2] == 0xd61f0220u, "br x17 last");
-		imm21 = (long)(((w[0] >> 29) & 0x3u) |
-			       (((w[0] >> 5) & 0x7ffffu) << 2));
-		if (imm21 & (1L << 20))
-			imm21 -= (1L << 21); /* the field is signed */
-		check((unsigned long)(((long)(site & ~0xfffull) + imm21 * 4096) +
-				      (long)((w[1] >> 10) & 0xfffu)) == hook,
-		      "adrp+add reaches the hook");
-		rc = uf_inline_entry(patch, sizeof patch, site,
-				     site + (1UL << 33));
+		check((patch & 0xfc000000u) == 0x14000000u, "single B emitted");
+		imm26 = patch & 0x03ffffffu;
+		if (imm26 & (1L << 25))
+			imm26 -= 1L << 26;
+		check(site + (unsigned long)(imm26 * 4) == hook,
+		      "B reaches the hook");
+		rc = uf_inline_entry(&patch, sizeof patch, site,
+				     site + (1UL << 27));
 		check(rc == UF_INLINE_ERANGE,
-		      "a hook out of adrp range is refused");
+		      "a hook out of branch range is refused");
 	}
 
 	if (failures == 0)

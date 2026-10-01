@@ -152,6 +152,11 @@ void uf_tier_revert(const char *family)
 {
 	int i;
 
+	if (uidfake_inline_active()) {
+		pr_warn("uidfake: inline tiers are permanent until reboot; keeping the registry\n");
+		return;
+	}
+
 	for (i = g_installed_n - 1; i >= 0; i--) {
 		if (strcmp(g_installed[i]->family, family) != 0)
 			continue;
@@ -162,6 +167,10 @@ void uf_tier_revert(const char *family)
 
 void uf_tier_revert_all(void)
 {
+	if (uidfake_inline_active()) {
+		pr_warn("uidfake: inline tiers are permanent until reboot; keeping the registry\n");
+		return;
+	}
 	while (g_installed_n > 0) {
 		g_installed[g_installed_n - 1]->remove();
 		g_installed_n--;

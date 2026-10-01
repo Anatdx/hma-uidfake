@@ -8,7 +8,7 @@
  * what starts the walk, names the winner in the log, and takes everything back
  * at unload. The mechanisms live in the files named after them:
  *
- *   inline_hooks.c   a copy of find_user / cap_task_fix_setuid
+ *   inline_hooks.c   short entry hooks for find_user / cap_task_fix_setuid
  *   table_hooks.c    the uid queries / the id setters in sys_call_table
  *   lsm.c            the LSM hook the kernel hands both creds to
  */
@@ -45,8 +45,8 @@ int hooks_install(void)
 
 	/*
 	 * The uid queries come first: they are the question every one of those
-	 * syscalls asks before it does anything, and answering it costs one copy of
-	 * find_user instead of eight table entries.
+	 * syscalls asks on its USER lookup path. One find_user entry hook serves
+	 * the native and compat callers.
 	 */
 	uid = uf_tier_install(UF_TIER_UID, uf_uid_tier);
 	if (uid)
@@ -69,17 +69,22 @@ int hooks_install(void)
 			uf_tier_name(UF_TIER_SETUID));
 	}
 
+	/* No installed family can use these tags if both attempts failed. Leave
+	 * existing tasks untouched so a diagnostics-only load can be unloaded
+	 * without leaving identity bits behind in thread_info.flags. */
+	if (uid && setuid)
+		return 0;
+
 	uidfake_tag_prime(); /* give the processes that already run their tag */
-	return (uid == 0 || setuid == 0) ? 1 : 0;
+	return 1;
 }
 
 void hooks_remove(void)
 {
 	/*
-	 * The entry patches go back first: a jump left pointing into this module
-	 * would be a wild branch the moment the module leaves. Then the apk inodes,
-	 * which are ours whatever the tables did, and then the rest of the setuid
-	 * family (the LSM slot or the setters behind it).
+	 * Published inline hooks pin the module and never reach normal unload.
+	 * Otherwise revert the uid family, release APK records, then revert the
+	 * setuid family (the LSM slot or syscall setters).
 	 */
 	uf_tier_revert(UF_TIER_UID);
 	uidfake_apk_remove();

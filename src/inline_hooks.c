@@ -1,239 +1,104 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * inline_hooks.c - the two mechanisms that answer by running a copy of a kernel
- * function.
+ * Runtime entry trampolines for find_user and the setuid LSM callback.
+ * A single direct B publishes each hook. No syscall table entry is touched by
+ * these tiers, and no kernel image profile or permanent probe is needed.
  *
- * One copy of find_user answers all four uid queries, and one copy of
- * cap_task_fix_setuid sees every identity change where the kernel commits it.
- * Both are built at load time by inline.c (whole function, relocated) and
- * entered through a twelve byte patch at the function's own entry, so the live
- * copy is what runs and the tables are not touched at all.
- *
- * These are the mechanisms that are tried first, for both families: they depend
- * on nothing but the symbol being where the kernel says it is.
+ * Successful publication pins the module until reboot. Restoring an entry is
+ * not enough to drain preempted module frames, especially the setuid path.
  */
 #include <linux/cred.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/string.h>
-#include <linux/syscalls.h>
 #include <linux/uidgid.h>
 #include <linux/user.h>
-#include <linux/version.h>
 
 #include "uidfake.h"
 #include "kaux.h"
 #include "inline.h"
+#include "inline_entry.h"
+#include "inline_alloc.h"
 #include "tier.h"
 
+#define UF_INLINE_STORAGE_SIZE 16
+#define UF_BTI_C 0xd503245fu
+#define UF_BTI_JC 0xd50324dfu
+#define UF_PACIASP 0xd503233fu
+#define UF_PACIBSP 0xd503237fu
+
+/* Assembly objects have instruction alignment, not unsigned-long alignment. */
+extern u32 g_find_user_copy[], g_setuid_copy[];
+/* Typed function aliases at the same RX addresses: direct calls need no CFI
+ * bypass or extra C bridge frame. The object aliases are only for text writes.
+ */
+extern struct user_struct *uf_find_user_orig(kuid_t uid);
+extern int uf_setuid_orig(struct cred *new, const struct cred *old, int flags);
 extern struct user_struct *uf_find_user_stub(kuid_t uid);
-struct user_struct *
-uf_find_user_hook(kuid_t uid); /* the asm above calls this */
+extern struct user_struct *uf_find_user_pacia_stub(kuid_t uid);
+extern struct user_struct *uf_find_user_pacib_stub(kuid_t uid);
+extern int uf_setuid_stub(struct cred *, const struct cred *, int);
+extern int uf_setuid_pacia_stub(struct cred *, const struct cred *, int);
+extern int uf_setuid_pacib_stub(struct cred *, const struct cred *, int);
+struct user_struct *uf_find_user_hook(kuid_t uid);
+int uf_setuid_inline_hook(struct cred *, const struct cred *, int);
 
-/*
- * The copy and the stub both live in one section that is executable and not
- * writable. It is written in asm for that reason: a C array put under a .text
- * name gets data flags from the compiler and ends up W+X, which a kernel with
- * STRICT_MODULE_RWX refuses to load (it did, on the first try).
- */
-/* Declared here and defined with the setuid hook below: the debug dump is
- * shared by both hooks. */
-#define UF_FIND_USER_COPY_SIZE 512u
-extern u8 g_find_user_copy[]; /* defined in the asm below */
-static unsigned long g_find_user_addr;
-static u8 g_find_user_saved[UF_INLINE_ENTRY];
-static bool g_find_user_hooked;
-
-/* The stub the entry patch jumps to. bti jc because that jump is indirect. */
-asm(".pushsection \".text.uf_inline\",\"ax\"\n"
-    ".balign 16\n"
-    ".global g_find_user_copy\n"
-    ".type g_find_user_copy, %object\n"
-    "g_find_user_copy:\n"
-    "\t.space 512, 0\n"
-    ".size g_find_user_copy, . - g_find_user_copy\n"
-    ".balign 4\n"
-    ".global uf_find_user_stub\n"
-    ".type uf_find_user_stub, %function\n"
-    "uf_find_user_stub:\n"
-    "\tbti jc\n"
-    "\tb uf_find_user_hook\n"
-    ".size uf_find_user_stub, . - uf_find_user_stub\n"
-    ".popsection\n");
-
-/*
- * Runs exactly where find_user would have run, with the same arguments and the
- * same stack. The real answer is always computed first, so an answer that is
- * about to be hidden costs what an answer that names a uid with no processes
- * costs; only the result is dropped.
- */
-/*
- * The call into the copy, from a function that may itself be reached through an
- * indirect call: on a kernel with CFI both ends of that are checked, and the copy
- * is in no jump table, so this is marked the way KernelSU marks its dispatcher.
- */
-static noinline struct user_struct *__nocfi uf_find_user_orig(kuid_t uid)
-{
-	return ((struct user_struct * (*)(kuid_t)) g_find_user_copy)(uid);
-}
+/* RX storage avoids STRICT_MODULE_RWX rejecting writable executable arrays. */
+#define UF_ASM_STUB(name, auth, hook)                                   \
+	".balign 4\n.global " name "\n.type " name ", %function\n" name \
+	":\n\tbti jc\n" auth "\tb " hook "\n"                           \
+	".size " name ", . - " name "\n"
+#define UF_ASM_COPY(name, original)                                           \
+	".balign 16\n.global " name "\n.type " name ", %object\n"             \
+	".global " original "\n.type " original ", %function\n" name          \
+	":\n" original                                                        \
+	":\n\t.space " __stringify(UF_INLINE_STORAGE_SIZE) ", 0\n"            \
+							   ".size " name      \
+							   ", . - " name "\n" \
+							   ".size " original  \
+							   ", . - " original  \
+							   "\n"
+asm(".pushsection \".text.uf_inline\",\"ax\"\n" UF_ASM_COPY(
+	"g_find_user_copy",
+	"uf_find_user_orig") UF_ASM_STUB("uf_find_user_stub", "",
+					 "uf_find_user_hook")
+	    UF_ASM_STUB(
+		    "uf_find_user_pacia_stub", "\tautiasp\n",
+		    "uf_find_user_hook") UF_ASM_STUB("uf_find_user_pacib_stub",
+						     "\tautibsp\n",
+						     "uf_find_user_hook")
+		    UF_ASM_COPY("g_setuid_copy", "uf_setuid_orig") UF_ASM_STUB(
+			    "uf_setuid_stub", "", "uf_setuid_inline_hook")
+			    UF_ASM_STUB("uf_setuid_pacia_stub", "\tautiasp\n",
+					"uf_setuid_inline_hook")
+				    UF_ASM_STUB(
+					    "uf_setuid_pacib_stub",
+					    "\tautibsp\n",
+					    "uf_setuid_inline_hook") ".popsection\n");
 
 noinline struct user_struct *uf_find_user_hook(kuid_t uid)
 {
-	struct user_struct *real = uf_find_user_orig(uid);
+	const u32 replacement = policy_query((u32)__kuid_val(uid));
+	const u32 query =
+		(u32)uf_select(replacement, __kuid_val(uid), replacement);
+	struct user_struct *real = uf_find_user_orig(KUIDT_INIT(query));
+	struct user_struct *drop =
+		(struct user_struct *)(unsigned long)uf_select(
+			(unsigned long)real, 0, replacement);
 
-	if (real == NULL)
+	/* A hidden target normally does one native miss in its own hash bucket,
+	 * without incrementing and then dropping the real target's reference.
+	 * A replacement UID may have become live since policy_apply: never return
+	 * that unrelated user or leak its reference. This is not a constant-time
+	 * guarantee; hash detection and bucket population still matter. */
+	if (unlikely(drop)) {
+		free_uid(drop);
 		return NULL;
-
-	/* Two things decide: the caller has to be an app with rules of its own, and
-	 * the uid asked about has to be one those rules hide. policy_query answers
-	 * both - it is the same gate the syscall wrappers use. */
-	if (policy_query((u32)__kuid_val(uid)) == 0)
-		return real;
-
-	/* A hidden uid answers like one that has no processes: the reference the
-	 * copy took is given back here, where the kernel would have given it back. */
-	free_uid(real);
-	return NULL;
+	}
+	return real;
 }
 
-static int find_user_hook_install(void)
-{
-	static u8 scratch[UF_FIND_USER_COPY_SIZE];
-	u32 patch[UF_INLINE_ENTRY / 4];
-	unsigned long size = 0, written = 0;
-	int rc;
-
-	if (g_find_user_hooked)
-		return 0;
-	if (!uidfake_symbol_range("find_user", &g_find_user_addr, &size)) {
-		pr_warn("uidfake: find_user is not in this kernel's symbols\n");
-		uidfake_status_note(-ENOENT);
-		return -ENOENT;
-	}
-	if (size < UF_INLINE_ENTRY || size > sizeof(scratch)) {
-		pr_warn("uidfake: find_user is %lu bytes, past the copy\n",
-			size);
-		uidfake_status_note(-E2BIG);
-		return -E2BIG;
-	}
-	uidfake_debug_dump("find_user", g_find_user_addr, size);
-
-	rc = uf_inline_relocate(scratch, sizeof(scratch),
-				(const void *)g_find_user_addr,
-				g_find_user_addr,
-				(unsigned long)g_find_user_copy, size,
-				&written);
-	if (rc != UF_INLINE_OK) {
-		pr_warn("uidfake: cannot copy find_user (%d); its code is not one this handles\n",
-			rc);
-		uidfake_status_note(rc);
-		return rc;
-	}
-
-	/* The copy and the stub live in this module's text, which is read-only: both
-	 * are written through the same alias path the kernel image uses. */
-	rc = uidfake_patch_text(g_find_user_copy, scratch, written, true);
-	if (rc != 0) {
-		pr_warn("uidfake: cannot place the find_user copy (%d)\n", rc);
-		uidfake_status_note(rc);
-		return rc;
-	}
-
-	rc = uf_inline_entry(patch, sizeof(patch), g_find_user_addr,
-			     (unsigned long)uf_find_user_stub);
-	if (rc != (int)UF_INLINE_ENTRY) {
-		pr_warn("uidfake: the jump to the hook does not fit (%d)\n",
-			rc);
-		uidfake_status_note(rc);
-		return rc;
-	}
-
-	memcpy(g_find_user_saved, (const void *)g_find_user_addr,
-	       UF_INLINE_ENTRY);
-	rc = uidfake_patch_text((void *)g_find_user_addr, patch,
-				UF_INLINE_ENTRY, true);
-	if (rc != 0 || memcmp((const void *)g_find_user_addr, patch,
-			      UF_INLINE_ENTRY) != 0) {
-		pr_warn("uidfake: the entry patch did not take (%d)\n", rc);
-		uidfake_patch_text((void *)g_find_user_addr, g_find_user_saved,
-				   UF_INLINE_ENTRY, true);
-		uidfake_status_note(-EIO);
-		return -EIO;
-	}
-
-	g_find_user_hooked = true;
-	pr_info("uidfake: uid queries are answered from a copy of find_user (%lu bytes copied)\n",
-		written);
-	return 0;
-}
-static void find_user_hook_remove(void)
-{
-	if (!g_find_user_hooked)
-		return;
-	/*
-	 * A restore that does not take is the one failure this module cannot undo:
-	 * the entry still points into this text, so unloading would leave a wild
-	 * branch behind. It is louder than a warning for that reason, and the only
-	 * way it happens is another patcher having taken the same twelve bytes since
-	 * we wrote them -- so it is not retried, it is reported.
-	 */
-	if (uidfake_patch_text((void *)g_find_user_addr, g_find_user_saved,
-			       UF_INLINE_ENTRY, true) == 0 &&
-	    memcmp((const void *)g_find_user_addr, g_find_user_saved,
-		   UF_INLINE_ENTRY) == 0)
-		g_find_user_hooked = false;
-	else
-		pr_err("uidfake: could not put find_user back; do NOT unload this module\n");
-}
-extern int uf_setuid_stub(struct cred *new, const struct cred *old, int flags);
-int uf_setuid_inline_hook(struct cred *new, const struct cred *old, int flags);
-
-#define UF_SETUID_COPY_SIZE 512u
-extern u8 g_setuid_copy[]; /* defined in the asm below */
-static unsigned long g_setuid_addr;
-static const char *g_setuid_name;
-static u8 g_setuid_saved[UF_INLINE_ENTRY];
-static bool g_setuid_hooked;
-
-/* The same section and the same reason as the find_user copy above: one ax
- * section holds both copies and both stubs. */
-asm(".pushsection \".text.uf_inline\",\"ax\"\n"
-    ".balign 16\n"
-    ".global g_setuid_copy\n"
-    ".type g_setuid_copy, %object\n"
-    "g_setuid_copy:\n"
-    "\t.space 512, 0\n"
-    ".size g_setuid_copy, . - g_setuid_copy\n"
-    ".balign 4\n"
-    ".global uf_setuid_stub\n"
-    ".type uf_setuid_stub, %function\n"
-    "uf_setuid_stub:\n"
-    "\tbti jc\n"
-    "\tb uf_setuid_inline_hook\n"
-    ".size uf_setuid_stub, . - uf_setuid_stub\n"
-    ".popsection\n");
-
-typedef int (*uf_setid_fn)(struct cred *new, const struct cred *old, int flags);
-
-/*
- * The call into the copy comes from a function that may itself be reached
- * through an indirect call, and the copy is in no jump table, so on a kernel
- * with CFI this is marked the way KernelSU marks its dispatcher.
- */
-static noinline int __nocfi uf_setuid_orig(struct cred *new,
-					   const struct cred *old, int flags)
-{
-	return ((uf_setid_fn)g_setuid_copy)(new, old, flags);
-}
-
-/*
- * Runs where cap_task_fix_setuid would have run, with the same arguments and the
- * same stack. The bookkeeping is the same code the LSM hook runs: a task that is
- * named already is left alone, because its name came from the one transition
- * that gave it its identity, and only a change that lands on an app uid says
- * anything.
- */
 noinline int uf_setuid_inline_hook(struct cred *new, const struct cred *old,
 				   int flags)
 {
@@ -245,8 +110,9 @@ noinline int uf_setuid_inline_hook(struct cred *new, const struct cred *old,
 
 	if (uidfake_tag_isset())
 		return uf_setuid_orig(new, old, flags);
-
 	ret = uf_setuid_orig(new, old, flags);
+	/* This observes the capability/LSM callback, before commit_creds. It
+	 * preserves the upstream tagging contract, not a post-commit guarantee. */
 	if (ret == 0 && interesting && (after % 100000u) >= UF_APP_MIN) {
 		uidfake_tag_adopt(before, after);
 		uidfake_tag_note(0, 0, before, after);
@@ -254,141 +120,246 @@ noinline int uf_setuid_inline_hook(struct cred *new, const struct cred *old,
 	return ret;
 }
 
-/*
- * Debug aid: the first bytes of a function about to be copied. Reading them
- * through the nofault copy is what makes a device's own code available for a
- * host test, and what tells a reader which encoding the last refusal was about.
- */
-/*
- * The plain symbol, not the jump-table spelling: a call site reaches the
- * function directly (the static call on 6.12 and later) or through its
- * jump-table entry, and that entry branches to the plain function, so patching
- * the plain one catches both.
- */
+struct uf_inline_hook {
+	const char *name;
+	u32 *copy;
+	unsigned long stub, pacia_stub, pacib_stub;
+	unsigned long site;
+	u32 saved;
+	bool installed;
+	struct uf_inline_region region;
+};
+
+static struct uf_inline_hook g_find_user = {
+	.name = "find_user",
+	.copy = g_find_user_copy,
+	.stub = (unsigned long)uf_find_user_stub,
+	.pacia_stub = (unsigned long)uf_find_user_pacia_stub,
+	.pacib_stub = (unsigned long)uf_find_user_pacib_stub,
+};
+static struct uf_inline_hook g_setuid = {
+	.name = "cap_task_fix_setuid",
+	.copy = g_setuid_copy,
+	.stub = (unsigned long)uf_setuid_stub,
+	.pacia_stub = (unsigned long)uf_setuid_pacia_stub,
+	.pacib_stub = (unsigned long)uf_setuid_pacib_stub,
+};
+
+bool uidfake_inline_active(void)
+{
+	return g_find_user.installed || g_setuid.installed;
+}
+
+static int inline_errno(int rc)
+{
+	switch (rc) {
+	case UF_INLINE_ESIZE:
+		return -E2BIG;
+	case UF_INLINE_EINSN:
+		return -EOPNOTSUPP;
+	case UF_INLINE_ERANGE:
+		return -ERANGE;
+	default:
+		return -EINVAL;
+	}
+}
+
+/* Called only during serialized module initialization. Nothing can enter the
+ * scratch/trampoline while it is being constructed. Only the displaced entry
+ * instructions are copied; the rest runs at its original kernel address. */
+static int inline_install(struct uf_inline_hook *hook)
+{
+	static u32 source[UF_INLINE_MAX_SOURCE / UF_INLINE_INSN];
+	static u32 scratch[UF_INLINE_STORAGE_SIZE / UF_INLINE_INSN];
+	unsigned long addr = 0, size = 0, stub = hook->stub;
+	size_t written = 0, skip = 0;
+	u32 patch;
+	bool distant = false;
+	int rc;
+
+	BUILD_BUG_ON(UF_INLINE_TRAMPOLINE_MAX + UF_INLINE_INSN >
+		     UF_INLINE_STORAGE_SIZE);
+	BUILD_BUG_ON(UF_INLINE_VENEER_SIZE > UF_INLINE_STORAGE_SIZE);
+	if (hook->installed)
+		return 0;
+	if (!uidfake_symbol_range(hook->name, &addr, &size))
+		return -ENOENT;
+	if ((addr & 3) || (size & 3) || size < UF_INLINE_INSN ||
+	    size > sizeof(source))
+		return -E2BIG;
+	if (!uidfake_read((const void *)addr, source, size))
+		return -EFAULT;
+	uidfake_debug_dump(hook->name, addr, size);
+
+	/* Preserve explicit BTI landing pads. PAC*SP is also a landing pad: if
+	 * first, leave it in place and undo precisely that signing in the stub,
+	 * before a C prologue changes SP or signs its own return address. */
+	if ((source[0] & 0xffffff3fu) == 0xd503241fu) {
+		skip = UF_INLINE_INSN;
+	} else if (source[0] == UF_PACIASP || source[0] == UF_PACIBSP) {
+		skip = UF_INLINE_INSN;
+		stub = source[0] == UF_PACIASP ? hook->pacia_stub :
+						 hook->pacib_stub;
+	}
+	if (size < skip + UF_INLINE_INSN)
+		return -EINVAL;
+	rc = uf_inline_entry(&patch, sizeof(patch), addr + skip, stub);
+	if (rc != UF_INLINE_ENTRY && rc != UF_INLINE_ERANGE)
+		return inline_errno(rc);
+	distant = rc == UF_INLINE_ERANGE;
+
+	/* The original may only be directly called and have no BTI of its own.
+	 * The helper can call this copy indirectly, so give it a known landing. */
+	scratch[0] = UF_BTI_C;
+	if (!distant) {
+		rc = uf_inline_trampoline(scratch + 1,
+					  sizeof(scratch) - UF_INLINE_INSN,
+					  source, addr,
+					  (unsigned long)(hook->copy + 1), size,
+					  skip, &written);
+		if (rc != UF_INLINE_OK && rc != UF_INLINE_ERANGE)
+			return inline_errno(rc);
+		distant = rc == UF_INLINE_ERANGE;
+		written += UF_INLINE_INSN;
+	}
+	if (distant) {
+		u32 *entry, *original;
+		size_t original_len;
+
+		/* Keep the kernel entry a single B. Only a private allocation holds
+		 * long veneers; no extra live instructions are overwritten. Each
+		 * hook owns its page, retained forever once the entry is published.
+		 */
+		rc = uidfake_inline_alloc(&hook->region, addr);
+		if (rc)
+			return rc;
+		entry = hook->region.addr;
+		original = entry + UF_INLINE_ISLAND_TRAMPOLINE / UF_INLINE_INSN;
+		rc = uf_inline_entry(&patch, sizeof(patch), addr + skip,
+				     (unsigned long)entry);
+		if (rc != UF_INLINE_ENTRY) {
+			rc = inline_errno(rc);
+			goto free_region;
+		}
+		original[0] = UF_BTI_JC;
+		rc = uf_inline_trampoline(
+			original + 1, UF_INLINE_STORAGE_SIZE - UF_INLINE_INSN,
+			source, addr, (unsigned long)(original + 1), size, skip,
+			&original_len);
+		if (rc != UF_INLINE_OK) {
+			rc = inline_errno(rc);
+			goto free_region;
+		}
+		rc = uf_inline_veneer(entry, UF_INLINE_ISLAND_TRAMPOLINE, stub,
+				      1);
+		if (rc != UF_INLINE_LANDING_VENEER_SIZE) {
+			rc = inline_errno(rc);
+			goto free_region;
+		}
+		/* The typed alias is still reached by a direct BL. Its private
+		 * veneer preserves LR, arguments, NZCV and SCS; IP0 is ABI scratch.
+		 * The island original trampoline resumes the body with a direct B.
+		 */
+		rc = uf_inline_veneer(scratch, sizeof(scratch),
+				      (unsigned long)original, 0);
+		if (rc != UF_INLINE_VENEER_SIZE) {
+			rc = inline_errno(rc);
+			goto free_region;
+		}
+		written = UF_INLINE_VENEER_SIZE;
+		rc = uidfake_inline_seal(&hook->region);
+		if (rc)
+			goto free_region;
+	}
+	rc = uidfake_patch_text(hook->copy, scratch, written, true);
+	if (rc)
+		goto free_region;
+	if (memcmp(hook->copy, scratch, written)) {
+		rc = -EIO;
+		goto free_region;
+	}
+	if (memcmp((const void *)addr, source, size)) {
+		rc = -EBUSY;
+		goto free_region;
+	}
+
+	hook->site = addr + skip;
+	hook->saved = source[skip / UF_INLINE_INSN];
+	/* Hold a real module reference BEFORE the kernel can branch into us.
+	 * uidfake_init must never return an error after a successful publication:
+	 * module-loader init failure frees even a module with outstanding refs. */
+	if (!try_module_get(THIS_MODULE)) {
+		rc = -ENODEV;
+		goto free_region;
+	}
+	rc = uidfake_patch_insn((void *)hook->site, hook->saved, patch);
+	if (rc) {
+		/* The single-word patch API guarantees failure leaves it unchanged. */
+		module_put(THIS_MODULE);
+		goto free_region;
+	}
+	hook->installed = true;
+	if (distant)
+		hook->region.published = true;
+	if (distant)
+		pr_info("uidfake: inline %s near island at %px, %zu bytes RO/X\n",
+			hook->name, hook->region.addr, hook->region.size);
+	pr_info("uidfake: inline %s: %zu-byte %s, one B, pinned until reboot\n",
+		hook->name, written,
+		distant ? "original-call veneer via near island" :
+			  "entry trampoline");
+	return 0;
+
+free_region:
+	uidfake_inline_free(&hook->region);
+	return rc;
+}
+
+static int find_user_hook_install(void)
+{
+	int rc = inline_install(&g_find_user);
+
+	if (rc)
+		uidfake_status_note(rc);
+	return rc;
+}
 
 static int setuid_inline_install(void)
 {
-	static const char *const names[] = {
-		"cap_task_fix_setuid",
-		"safesetid_task_fix_setuid",
-	};
-	static u8 scratch[UF_SETUID_COPY_SIZE];
-	u32 patch[UF_INLINE_ENTRY / 4];
-	unsigned long addr = 0, size = 0, written = 0;
-	const char *name = NULL;
-	unsigned int i;
-	int rc;
+	int rc = inline_install(&g_setuid);
 
-	if (g_setuid_hooked)
-		return 0;
-
-	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		unsigned long a = 0, n = 0;
-
-		if (uidfake_symbol_range(names[i], &a, &n)) {
-			addr = a;
-			size = n;
-			name = names[i];
-			break;
-		}
+	/* Preserve the upstream symbol fallback when capability's body is absent. */
+	if (rc == -ENOENT && !strcmp(g_setuid.name, "cap_task_fix_setuid")) {
+		g_setuid.name = "safesetid_task_fix_setuid";
+		rc = inline_install(&g_setuid);
 	}
-	if (addr == 0) {
-		pr_warn("uidfake: neither %s nor %s is in this kernel's symbols\n",
-			names[0], names[1]);
-		uidfake_status_note(-ENOENT);
-		return -ENOENT;
-	}
-	if (size < UF_INLINE_ENTRY || size > sizeof(scratch)) {
-		pr_warn("uidfake: %s is %lu bytes, past the copy\n", name,
-			size);
-		uidfake_status_note(-E2BIG);
-		return -E2BIG;
-	}
-	uidfake_debug_dump(name, addr, size);
-
-	rc = uf_inline_relocate(scratch, sizeof(scratch), (const void *)addr,
-				addr, (unsigned long)g_setuid_copy, size,
-				&written);
-	if (rc != UF_INLINE_OK) {
-		pr_warn("uidfake: cannot copy %s (%d); its code is not one this handles\n",
-			name, rc);
+	if (rc) {
 		uidfake_status_note(rc);
 		return rc;
 	}
-
-	/* The copy is placed by the write path the kernel image uses: this module's
-	 * text is mapped read-only, so the write goes through the alias. */
-	rc = uidfake_patch_text(g_setuid_copy, scratch, written, true);
-	if (rc != 0) {
-		pr_warn("uidfake: cannot place the %s copy (%d)\n", name, rc);
-		uidfake_status_note(rc);
-		return rc;
-	}
-
-	rc = uf_inline_entry(patch, sizeof(patch), addr,
-			     (unsigned long)uf_setuid_stub);
-	if (rc != (int)UF_INLINE_ENTRY) {
-		pr_warn("uidfake: the jump to the setuid hook does not fit (%d)\n",
-			rc);
-		uidfake_status_note(rc);
-		return rc;
-	}
-
-	memcpy(g_setuid_saved, (const void *)addr, UF_INLINE_ENTRY);
-	rc = uidfake_patch_text((void *)addr, patch, UF_INLINE_ENTRY, true);
-	if (rc != 0 ||
-	    memcmp((const void *)addr, patch, UF_INLINE_ENTRY) != 0) {
-		pr_warn("uidfake: the entry patch on %s did not take (%d)\n",
-			name, rc);
-		uidfake_status_note(rc != 0 ? rc : -EIO);
-		return rc != 0 ? rc : -EIO;
-	}
-
-	g_setuid_addr = addr;
-	g_setuid_name = name;
-	g_setuid_hooked = true;
-	uidfake_status_set_lsm(KAUX_LSM_TAKEN, 0, "inline cap_task_fix_setuid");
-	pr_info("uidfake: id changes are watched from a copy of %s (%lu bytes copied)\n",
-		name, written);
+	uidfake_status_set_lsm(KAUX_LSM_TAKEN, 0, g_setuid.name);
 	return 0;
 }
-static void setuid_inline_remove(void)
-{
-	if (!g_setuid_hooked)
-		return;
-	if (uidfake_patch_text((void *)g_setuid_addr, g_setuid_saved,
-			       UF_INLINE_ENTRY, true) == 0 &&
-	    memcmp((const void *)g_setuid_addr, g_setuid_saved,
-		   UF_INLINE_ENTRY) == 0)
-		g_setuid_hooked = false;
-	else
-		pr_err("uidfake: could not put %s back; do NOT unload this module\n",
-		       g_setuid_name ? g_setuid_name : "cap_task_fix_setuid");
-}
 
-/*
- * The uid mechanism on top of the copy: the copy itself installs, and what is
- * left here is what the module reports about it -- one write point, so nothing
- * is counted in the tables.
- */
 static int uid_inline_install(void)
 {
-	const int rc = find_user_hook_install();
+	int rc = find_user_hook_install();
 
-	if (rc == 0) {
+	if (!rc) {
 		uidfake_status_set_hooks_expected(0, 0);
 		uidfake_status_add_flags(KAUX_F_PRIO_INLINE);
 	}
 	return rc;
 }
 
-static void uid_inline_remove(void)
+static void inline_remove(void)
 {
-	find_user_hook_remove();
+	/* Normally unreachable: successful publication retains a module ref.
+	 * Tier teardown also refuses while either permanent inline tier is live. */
+	WARN_ON_ONCE(uidfake_inline_active());
 }
 
 UF_TIER(uf_tier_uid_inline, UF_TIER_UID, "inline", "inline find_user", 10,
-	uid_inline_install, uid_inline_remove);
+	uid_inline_install, inline_remove);
 UF_TIER(uf_tier_setuid_inline, UF_TIER_SETUID, "inline",
-	"inline cap_task_fix_setuid", 10, setuid_inline_install,
-	setuid_inline_remove);
+	"inline cap_task_fix_setuid", 10, setuid_inline_install, inline_remove);

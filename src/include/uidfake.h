@@ -152,7 +152,8 @@ static __always_inline u64 uf_select(u64 when_true, u64 when_false, u32 nonzero)
 
 	asm("cmp\t%w3, #0\n\tcsel\t%0, %1, %2, ne"
 	    : "=r"(out)
-	    : "r"(when_true), "r"(when_false), "r"(nonzero));
+	    : "r"(when_true), "r"(when_false), "r"(nonzero)
+	    : "cc");
 	return out;
 #else
 	/* The host test and the userspace model compile this file too. A real branch is fine
@@ -202,7 +203,13 @@ void policy_free(void);
 int hooks_install(void);
 void hooks_remove(void);
 
+/* Bulk writes for unpublished clones and legacy data slots, not live entry
+ * instructions. A failed bulk write can have changed a prefix. */
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync);
+/* Compare and publish one aligned kernel instruction while CPUs are stopped.
+ * A nonzero return means this operation did not change the instruction. */
+int uidfake_patch_insn(void *dst, u32 expected, u32 replacement);
+bool uidfake_inline_active(void);
 
 /* Read kernel text through the nofault copy, for diagnostics only. */
 bool uidfake_read(const void *src, void *dst, size_t len);

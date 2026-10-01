@@ -14,6 +14,13 @@
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif
 #include <errno.h> /* tiers.c returns -ENOENT and -ENODEV */
+#include <stdbool.h>
+
+bool uidfake_inline_active(void)
+{
+	return false;
+}
+
 #include "tiers.c"
 
 #include <stdio.h>

@@ -40,7 +40,7 @@ KBUILD_ARGS := M=$(MDIR)
 endif
 
 obj-m += hma_uidfake.o
-hma_uidfake-objs := main.o patch.o inline.o status.o tag.o inline_hooks.o \
+hma_uidfake-objs := main.o patch.o inline.o inline_entry.o inline_alloc.o status.o tag.o inline_hooks.o \
 	table_hooks.o inode_hook.o hooks.o policy.o lsm.o netlink.o tiers.o
 
 ifeq ($(strip $(LSE_HDR)$(SP_REG)$(KGDB_BRK)),)

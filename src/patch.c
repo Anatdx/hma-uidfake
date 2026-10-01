@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * patch.c - write a few bytes into read-only kernel or module text.
+ * patch.c - publish single instructions and populate unused module text.
  *
- * Kernel text is mapped read-only and the helpers that would normally make it
- * writable (set_memory_rw, text_poke) are not exported to modules. Instead the
- * physical address is translated through init_mm and the page is mapped again
- * writable through the kernel's own fixmap window -- the way the kernel itself
- * pokes text -- and a nofault copy does the write, so a translation that went
- * wrong is an error and not a fault. The caches are cleaned afterwards and the
- * synchronous path stops all other CPUs, because one of them can be executing
- * the very instruction being replaced.
+ * Live instructions use the running kernel's ARM64 patch helper. Entry
+ * publication compares and replaces one aligned instruction with all CPUs
+ * stopped, completes cache maintenance, then executes ISB on every CPU.
  *
- * The technique is the one every out-of-tree patcher on arm64 ends up using;
- * this is an independent implementation.
+ * The older writable-fixmap path remains for syscall/LSM data slots when
+ * fallback tiers are used. It is not used to publish inline entry branches.
  */
 #include <asm/cacheflush.h>
 #include <asm/fixmap.h>
 #include <asm/pgtable.h>
 #include <linux/kprobes.h>
+#include <linux/cpu.h>
+#include <linux/mutex.h>
 #include <linux/version.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
@@ -80,6 +77,7 @@ struct find_ctx {
 	const char *name;
 	unsigned long addr;
 	unsigned long next; /* the following symbol: where the body ends */
+	bool prefer_cfi;
 };
 
 /*
@@ -95,9 +93,9 @@ static int find_symbol_cb(void *data, const char *name, unsigned long addr)
 	if (!ctx->addr && name && strcmp(name, ctx->name) == 0)
 		ctx->addr = addr;
 #if !UF_USE_KCFI
-	/* The jump-table variant is the one a call site can reach: prefer it, and
-	 * stop looking once it is found. */
-	{
+	/* Only callable-address lookup prefers the jump table. A body/range or
+	 * raw-pointer lookup must never switch to this veneer or stop here. */
+	if (ctx->prefer_cfi) {
 		const size_t len = ctx->name ? strlen(ctx->name) : 0;
 		const char *suffix = ".cfi_jt";
 
@@ -123,11 +121,13 @@ static int find_symbol_cb_mod(void *data, const char *name, struct module *mod,
 }
 #endif
 
-static noinline void __nocfi find_symbol(const char *name, struct find_ctx *ctx)
+static noinline void __nocfi find_symbol(const char *name, struct find_ctx *ctx,
+					 bool prefer_cfi)
 {
 	ctx->name = name;
 	ctx->addr = 0;
 	ctx->next = 0;
+	ctx->prefer_cfi = prefer_cfi;
 	/*
 	 * The walk takes the callback first and its data second -- both signatures
 	 * do, the one whose callback has the module argument and the one without.
@@ -187,7 +187,7 @@ unsigned long uidfake_lookup(const char *name)
 	{
 		struct find_ctx ctx;
 
-		find_symbol(name, &ctx);
+		find_symbol(name, &ctx, true);
 		return ctx.addr;
 	}
 }
@@ -207,21 +207,21 @@ unsigned long uidfake_lookup_raw(const char *name)
 	{
 		struct find_ctx ctx;
 
-		find_symbol(name, &ctx);
+		find_symbol(name, &ctx, false);
 		return ctx.addr;
 	}
 }
 
 /*
- * A symbol's address and extent, for a caller that has to copy the function whole:
- * the following symbol bounds it, and the walk already computes that.
+ * A symbol's address and extent for validating a complete function snapshot.
+ * The following symbol bounds it, and the walk already computes that.
  */
 bool uidfake_symbol_range(const char *name, unsigned long *addr,
 			  unsigned long *size)
 {
 	struct find_ctx ctx;
 
-	find_symbol(name, &ctx);
+	find_symbol(name, &ctx, false);
 	if (!ctx.addr || ctx.next <= ctx.addr)
 		return false;
 	*addr = ctx.addr;
@@ -235,7 +235,7 @@ bool uidfake_symbol_range(const char *name, unsigned long *addr,
  */
 static struct mm_struct *patch_mm;
 
-/* defined below; the calibration at load asks both of them about _stext */
+/* Defined below; lazy legacy-mapping calibration probes _stext with both. */
 static phys_addr_t phys_from_virt(unsigned long addr);
 static phys_addr_t image_phys(unsigned long addr);
 
@@ -247,9 +247,12 @@ static unsigned long g_mod_start;
 static unsigned long g_mod_end;
 static unsigned long g_text_start;
 static unsigned long g_text_end;
+static unsigned long g_core_text_end;
 
 static bool writable_range(unsigned long addr, size_t len)
 {
+	if (addr + len < addr)
+		return false;
 	if (g_text_start && g_text_end && addr >= g_text_start &&
 	    addr + len <= g_text_end)
 		return true;
@@ -272,6 +275,7 @@ static bool g_offset_warned;
  */
 static unsigned long g_vmemmap;
 static bool g_walk_usable = true;
+static bool g_legacy_prepared;
 /*
  * FIXADDR_TOP as this kernel has it, worked out from the kernel's own vmemmap
  * pointer: memory.h defines it as VMEMMAP_START - SZ_32M, and vmemmap is that
@@ -294,11 +298,20 @@ static unsigned long g_fixmap_top;
 static unsigned long g_set_fixmap_addr;
 static unsigned long g_copy_nofault_addr;
 static unsigned long g_copy_from_nofault_addr;
+static unsigned long g_patch_insn_addr;
+/* Serialize our expected-value checks with our other patch operations. */
+static DEFINE_MUTEX(g_patch_mutex);
 
 typedef void (*uf_set_fixmap_t)(enum fixed_addresses idx, phys_addr_t phys,
 				pgprot_t prot);
 typedef long (*uf_copy_nofault_t)(void *dst, const void *src, size_t size);
 typedef long (*uf_copy_from_nofault_t)(void *dst, const void *src, size_t size);
+typedef int (*uf_patch_insn_t)(void *addr, u32 insn);
+
+static noinline int __nocfi patch_native_insn(void *addr, u32 insn)
+{
+	return ((uf_patch_insn_t)g_patch_insn_addr)(addr, insn);
+}
 
 static noinline void __nocfi patch_set_fixmap(enum fixed_addresses idx,
 					      phys_addr_t phys, pgprot_t prot)
@@ -363,6 +376,7 @@ int uidfake_patch_init(void)
 	 * write would land somewhere it has no business being. */
 	g_text_start = uidfake_lookup("_stext");
 	g_text_end = uidfake_lookup("_end");
+	g_core_text_end = uidfake_lookup("_etext");
 
 	/*
 	 * This module's own text: the copy of a hooked function and the stub that
@@ -390,23 +404,18 @@ int uidfake_patch_init(void)
 	if (!g_copy_from_nofault_addr)
 		g_copy_from_nofault_addr =
 			uidfake_lookup("__copy_from_kernel_nofault");
+	/* Stable arm64 signature across supported ACK trees; the implementation
+	 * owns its fixmap geometry, lock and instruction cache maintenance. */
+	g_patch_insn_addr = uidfake_lookup("aarch64_insn_patch_text_nosync");
 	if (UF_DEBUG_ON())
 		pr_info("uidfake: init_mm=%px kimage_voffset=%px memstart_addr=%px set_fixmap=%px nofault=%px mod=%#lx-%#lx\n",
 			(void *)patch_mm, (void *)g_kimage_voffset,
 			(void *)g_memstart_addr, (void *)g_set_fixmap_addr,
 			(void *)g_copy_nofault_addr, (unsigned long)g_mod_start,
 			(unsigned long)g_mod_end);
-	if (!patch_mm || !g_set_fixmap_addr)
+	if ((!patch_mm || !g_set_fixmap_addr) && !g_patch_insn_addr)
 		return -ENOENT;
 
-	/*
-	 * One calibration, at load: if the walk and the image offset disagree about
-	 * where the kernel's own text is, the walk is the one that is wrong on this
-	 * device -- it goes through this module's view of struct mm_struct and of the
-	 * page table geometry, and a kernel of the same version can be built with a
-	 * different VA size. It is the offset that holds on every configuration, and
-	 * the offset is what the write needs, so the walk steps aside.
-	 */
 	g_vmemmap = uidfake_lookup_raw("vmemmap");
 	if (g_vmemmap)
 		g_fixmap_top = g_vmemmap - SZ_32M;
@@ -416,7 +425,18 @@ int uidfake_patch_init(void)
 			(unsigned long)__fix_to_virt(FIX_TEXT_POKE0) +
 				((unsigned long)FIX_TEXT_POKE0 << PAGE_SHIFT));
 
-	if (g_text_start) {
+	return 0;
+}
+
+/* Only fallback data-slot writes use the module-side mapping code. Keep its
+ * calibration out of initialization so the native inline path never walks a
+ * vendor init_mm using this module's possibly different layout/VA geometry.
+ * Called before stop_machine with g_patch_mutex held. */
+static void prepare_legacy_patch(void)
+{
+	if (g_legacy_prepared)
+		return;
+	if (patch_mm && g_text_start) {
 		phys_addr_t walk = phys_from_virt(g_text_start);
 		phys_addr_t offset = image_phys(g_text_start);
 
@@ -425,12 +445,14 @@ int uidfake_patch_init(void)
 			pr_info("uidfake: page table walk disagrees with kimage_voffset (kernel geometry is not this module's); using the image offset alone\n");
 		}
 	}
-	return 0;
+	g_legacy_prepared = true;
 }
 struct patch_req {
 	void *addr;
 	const void *src;
 	size_t len;
+	atomic_t cpu_count;
+	int result;
 };
 
 /*
@@ -670,13 +692,129 @@ static int patch_nosync(void *dst, const void *src, size_t len)
 static int patch_do(void *arg)
 {
 	struct patch_req *r = arg;
+	unsigned long start = (unsigned long)r->addr;
+	size_t off;
+	int ret;
 
-	return patch_nosync(r->addr, r->src, r->len);
+	/* These bytes are an unpublished clone. Use the kernel's own mapping
+	 * for module text when available, avoiding a module-side page-table walk.
+	 * A failure here may leave a partial clone, but no entry can reach it yet.
+	 */
+	if (g_patch_insn_addr && g_mod_start && start >= g_mod_start &&
+	    start + r->len <= g_mod_end) {
+		for (off = 0; off < r->len; off += sizeof(u32)) {
+			__le32 insn;
+
+			memcpy(&insn, (const u8 *)r->src + off, sizeof(insn));
+			ret = patch_native_insn((u8 *)r->addr + off,
+						le32_to_cpu(insn));
+			if (ret)
+				return ret;
+		}
+		return 0;
+	}
+	if (!patch_mm || !g_set_fixmap_addr)
+		return -EOPNOTSUPP;
+	ret = patch_nosync(r->addr, r->src, r->len);
+	/* Even a failed bulk copy can have changed a prefix. Complete cache
+	 * maintenance before any stopped CPU resumes in either case. */
+	cache_clean_inval(r->addr, r->len);
+	return ret;
+}
+
+static int patch_stopped(void *arg)
+{
+	struct patch_req *r = arg;
+
+	/* All online CPUs participate, as in aarch64_insn_patch_text(). The
+	 * last arrival writes; every CPU executes ISB after cache maintenance. */
+	if (atomic_inc_return(&r->cpu_count) == num_online_cpus()) {
+		r->result = patch_do(r);
+		atomic_inc(&r->cpu_count);
+	} else {
+		while (atomic_read(&r->cpu_count) <= num_online_cpus())
+			cpu_relax();
+	}
+	isb();
+	return 0;
+}
+
+struct insn_patch_req {
+	void *addr;
+	u32 expected;
+	u32 replacement;
+	atomic_t cpu_count;
+	int result;
+};
+
+static int patch_insn_stopped(void *arg)
+{
+	struct insn_patch_req *r = arg;
+	__le32 observed;
+
+	if (atomic_inc_return(&r->cpu_count) == num_online_cpus()) {
+		if (!uidfake_read(r->addr, &observed, sizeof(observed)))
+			r->result = -EFAULT;
+		else if (le32_to_cpu(observed) != r->expected)
+			r->result = -EBUSY;
+		else
+			r->result = patch_native_insn(r->addr, r->replacement);
+		/* The native helper has finished its cache maintenance here. */
+		atomic_inc(&r->cpu_count);
+	} else {
+		while (atomic_read(&r->cpu_count) <= num_online_cpus())
+			cpu_relax();
+	}
+	isb();
+	return 0;
+}
+
+/*
+ * Publish exactly one aligned A64 instruction. In supported ARM64 ACK kernels
+ * aarch64_insn_patch_text_nosync() writes one aligned u32 through the kernel's
+ * own fixmap, under its patch_lock. Although that helper uses the nofault API,
+ * a four-byte write takes exactly one __put_kernel_nofault(..., u32) / STR W,
+ * not a sequence of byte copies: an error leaves this instruction unchanged.
+ * No fallible operation follows the store other than the kernel helper's
+ * non-failing cache maintenance. Do not substitute the bulk-copy path here.
+ *
+ * The source instruction is compared after other CPUs have stopped. This
+ * guards against an entry already changed by another patcher, not against a
+ * foreign patcher subsequently modifying the copied function body.
+ */
+int uidfake_patch_insn(void *dst, u32 expected, u32 replacement)
+{
+	unsigned long addr = (unsigned long)dst;
+	struct insn_patch_req req = {
+		.addr = dst,
+		.expected = expected,
+		.replacement = replacement,
+		.cpu_count = ATOMIC_INIT(0),
+	};
+	int ret;
+
+	if (addr & 3)
+		return -EINVAL;
+	if (!g_text_start || !g_core_text_end || addr < g_text_start ||
+	    addr >= g_core_text_end || g_core_text_end - addr < sizeof(u32))
+		return -EPERM;
+	if (!g_patch_insn_addr || !g_copy_from_nofault_addr)
+		return -EOPNOTSUPP;
+	mutex_lock(&g_patch_mutex);
+	ret = stop_machine(patch_insn_stopped, &req, cpu_online_mask);
+	mutex_unlock(&g_patch_mutex);
+	return ret ? ret : req.result;
 }
 
 int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 {
-	struct patch_req req = { .addr = dst, .src = src, .len = len };
+	struct patch_req req = {
+		.addr = dst,
+		.src = src,
+		.len = len,
+		.cpu_count = ATOMIC_INIT(0),
+	};
+	bool native_module;
 	int ret;
 
 	if (!len || (unsigned long)dst & 3 || len & 3)
@@ -690,14 +828,30 @@ int uidfake_patch_text(void *dst, const void *src, size_t len, bool sync)
 			pr_info("uidfake:   %px\n", dst);
 		return -EPERM;
 	}
-	if (offset_in_page((unsigned long)dst) + len > PAGE_SIZE)
+	native_module = g_patch_insn_addr && g_mod_start &&
+			(unsigned long)dst >= g_mod_start &&
+			(unsigned long)dst + len <= g_mod_end;
+	/* Each native instruction write maps its own page. Only the legacy bulk
+	 * alias writer is constrained to a single physical page. */
+	if (!native_module &&
+	    offset_in_page((unsigned long)dst) + len > PAGE_SIZE)
 		return -EINVAL;
-
-	ret = sync ? stop_machine(patch_do, &req, NULL) : patch_do(&req);
-	if (ret)
-		return ret;
-
-	/* make the new instructions visible to every CPU */
-	cache_clean_inval(dst, len);
-	return 0;
+	/* The legacy fixmap path is only safe while other CPUs are stopped.
+	 * Non-stopping writes are limited to unpublished module text and use the
+	 * kernel's own locked mapper. Its entry publication supplies the final
+	 * all-CPU synchronization before the clone can be executed. */
+	if (!sync && !native_module)
+		return -EINVAL;
+	mutex_lock(&g_patch_mutex);
+	if (!native_module)
+		prepare_legacy_patch();
+	if (sync) {
+		ret = stop_machine(patch_stopped, &req, cpu_online_mask);
+		if (!ret)
+			ret = req.result;
+	} else {
+		ret = patch_do(&req);
+	}
+	mutex_unlock(&g_patch_mutex);
+	return ret;
 }

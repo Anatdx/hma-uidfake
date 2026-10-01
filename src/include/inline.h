@@ -10,53 +10,41 @@
 #endif
 
 /*
- * inline.h - the runtime side of an inline hook: build a callable copy of a
- * kernel function, and the entry patch that sends callers to us instead.
- *
- * The copy exists because of the two things a module cannot do: it cannot jump
- * back into the middle of kernel text (the pages carry BTI, so an indirect branch
- * must land on a bti/paciasp instruction, which no function's middle is), and it
- * cannot place its own trampoline inside the kernel image the way an image
- * patcher does. Copying the whole function avoids both: the copy is entered at
- * its own beginning and returns normally, so nothing jumps into the middle of
- * anything.
- *
- * Relocation is deliberate and narrow. An instruction whose PC-relative operand
- * points inside the function keeps its encoding -- the copy is contiguous and in
- * order, so those distances are unchanged -- and only the ones that leave the
- * function (adrp/add pairs and bl targets) are rewritten into absolute form. Any
- * encoding this file does not know is a refusal (-ENOTSUP), never a guess: a
- * silently mis-relocated function would be worse than no hook at all.
+ * Runtime A64 function copies, derived from the running kernel's instructions.
+ * Internal branches are remapped through the complete output layout. ADRP
+ * preserves its original page value and leaves all consumers in place. External
+ * branches remain direct; unsupported PC-relative forms or unreachable targets
+ * are refused before writing output. This is not an arbitrary-code translator:
+ * callers must supply a complete function without embedded data or external
+ * fixups (such as exception-table entries).
  */
-
-/* One instruction is 4 bytes; the longest rewritten form is 20 (movz/movk*4 + blr). */
 #define UF_INLINE_INSN 4u
+#define UF_INLINE_MAX_SOURCE 1024u
+#define UF_INLINE_MAX_COPY (UF_INLINE_MAX_SOURCE * 4u + UF_INLINE_INSN)
 
-/* Why a relocation failed. */
 #define UF_INLINE_OK 0
-#define UF_INLINE_ESIZE (-1) /* the destination buffer is too small */
-#define UF_INLINE_EINSN (-2) /* an instruction this file does not handle */
-#define UF_INLINE_ERANGE (-3) /* a branch target outside the function */
+#define UF_INLINE_ESIZE (-1) /* empty/oversize input or insufficient output */
+#define UF_INLINE_EINSN (-2) /* unsupported encoding or unaligned input */
+#define UF_INLINE_ERANGE (-3) /* a relative target cannot be represented */
 
 /*
- * Copy the function that ran at @from_va (its bytes at @from, @len long) into
- * @to, where it will run at @to_va. Returns the length written in @out_len and
- * UF_INLINE_OK, or a UF_INLINE_E* code.
+ * @from and @to must be disjoint, instruction-aligned buffers. Addresses denote
+ * the runtime locations, which can differ from those buffers. No output bytes
+ * are written on failure; @out_len is zero on failure if provided. The copy
+ * begins with the original first instruction; an indirect caller must arrange
+ * a BTI landing pad before it when required.
  */
 int uf_inline_relocate(void *to, size_t to_size, const void *from,
 		       unsigned long from_va, unsigned long to_va, size_t len,
 		       size_t *out_len);
 
 /*
- * The entry patch: three instructions and no literal pool. A literal load reaches
- * only 1 MB, and a module sits far from the kernel's text, so the jump has to be
- * built from adrp/add, which reach +-4 GB:
- *
- *     adrp x17, hook ; add x17, x17, #:lo12:hook ; br x17
- *
- * The hook has to start with a landing pad, because that br is an indirect jump.
- * Returns the byte count, or a UF_INLINE_E* code.
+ * One B instruction, with no scratch register or indirect landing-pad demand.
+ * The live site must be aligned and the target within [-128 MiB, +128 MiB-4].
+ * The installer must preserve an existing entry BTI instruction and select the
+ * following instruction as @site_va. Publishing still needs an SMP instruction
+ * synchronization protocol; this helper only builds the replacement word.
  */
-#define UF_INLINE_ENTRY 12u
+#define UF_INLINE_ENTRY 4u
 int uf_inline_entry(void *out, size_t out_size, unsigned long site_va,
 		    unsigned long hook_va);

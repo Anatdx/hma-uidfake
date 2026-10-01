@@ -1,316 +1,183 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * inline.c - the runtime half of an inline hook; see inline.h for why a copy is
- * built instead of a jump-back trampoline.
- *
- * Two passes. The first decides how long each source instruction becomes in the
- * copy and where it lands; the second emits. The map is what lets a branch inside
- * the function keep pointing at the same instruction after the instructions
- * before it changed size.
- *
- * Relocation is narrow on purpose: an instruction whose target is inside the
- * function keeps its encoding (the copy is contiguous and in order), and only
- * the operands that leave the function - an adrp page, a bl target - are turned
- * into absolute form. Anything this file does not understand is a refusal, never
- * a guess: a silently mis-relocated copy would be worse than no hook.
+ * Relocate a bounded A64 function without changing the order of its operations.
+ * Every source instruction has a destination slot. ADRP keeps its original page
+ * value; its consumers are never folded or moved. Branches use that complete
+ * layout, including ordinary B and branches into ADRP consumers.
  */
 #include "include/inline.h"
 
-/* Opcode patterns. */
 #define UF_B 0x14000000u
 #define UF_BL 0x94000000u
-#define UF_CBZ 0x34000000u
-#define UF_CBNZ 0x35000000u
-#define UF_TBZ 0x36000000u
-#define UF_TBNZ 0x37000000u
-#define UF_BCOND 0x54000000u
 #define UF_ADRP 0x90000000u
 #define UF_ADR 0x10000000u
-#define UF_ADD_IMM 0x11000000u /* sf and shift are operands, not opcode */
-#define UF_SUB_IMM 0x51000000u
-#define UF_LDR_U64 0xf9400000u
-#define UF_LDR_U32 0xb9400000u
-#define UF_LDRSW 0xb9800000u
+#define UF_INSNS (UF_INLINE_MAX_SOURCE / UF_INLINE_INSN)
 
-#define UF_M_BRANCH 0xfc000000u /* b, bl (bit 31 tells them apart) */
-#define UF_M_COND 0x7f000000u /* cbz, cbnz, tbz, tbnz (bit 31 is the width) */
-#define UF_M_BCOND 0xff000010u /* b.<cond> */
-#define UF_M_ADRP 0x9f000000u /* adrp and adr share this mask */
-#define UF_M_ADDSUB 0x7f800000u
-#define UF_M_LDR 0xffc00000u
-#define UF_M_LITERAL 0xff000000u
-
-#define UF_INSNS 128u
-#define UF_LOOKAHEAD 4u
-#define UF_MAX_OUT (UF_INSNS * 5u * UF_INLINE_INSN)
-
-#define UF_X17 17u /* IP1: not an argument, and not x18 (shadow call stack) */
-
-/* The host test turns these on to see which instruction was refused. */
 #ifdef UF_INLINE_DEBUG
 unsigned int uf_inline_dbg_insn;
 unsigned int uf_inline_dbg_index;
 unsigned int uf_inline_dbg_stage;
 #endif
 
-static int uf_sx(unsigned int value, unsigned int bits)
+static long uf_sx(unsigned int value, unsigned int bits)
 {
 	const unsigned int sign = 1u << (bits - 1);
 
-	return (int)((value ^ sign) - sign);
+	return (long)(value & (sign - 1)) - (long)(value & sign);
 }
 
-/* movz/movk sequence that materialises @value in x@rd; returns the word count. */
-static unsigned int uf_mov_imm(unsigned int *out, unsigned int rd,
-			       unsigned long value)
+/* Unsigned VA arithmetic also works in the upper half of the address space. */
+static int uf_displacement(unsigned long site, unsigned long target,
+			   unsigned int shift, unsigned int bits, long *imm)
 {
-	unsigned int n = 0, k;
+	const unsigned long unit = 1UL << shift;
+	const unsigned long limit = 1UL << (bits - 1);
+	unsigned long distance;
 
-	for (k = 0; k < 4; k++) {
-		const unsigned int half =
-			(unsigned int)((value >> (16 * k)) & 0xffffu);
-
-		if (k == 0)
-			out[n++] = 0xd2800000u | (half << 5) | rd; /* movz */
-		else if (half || (value >> (16 * k)) != 0)
-			out[n++] = 0xf2800000u | (k << 21) | (half << 5) |
-				   rd; /* movk */
+	if ((site | target) & (unit - 1))
+		return UF_INLINE_ERANGE;
+	if (target >= site) {
+		distance = (target - site) >> shift;
+		if (distance >= limit)
+			return UF_INLINE_ERANGE;
+		*imm = (long)distance;
+	} else {
+		distance = (site - target) >> shift;
+		if (distance > limit)
+			return UF_INLINE_ERANGE;
+		*imm = -(long)distance;
 	}
-	return n;
+	return UF_INLINE_OK;
 }
 
-/*
- * What an instruction reads and writes, for the classes that appear between an
- * adrp and its user. Returns 0 when the class is not understood, and the caller
- * then refuses: guessing about liveness is how a copy gets silently broken.
- */
-static int uf_reads_writes(unsigned int insn, int *rd, int *rn)
+static unsigned long uf_adrp_value(unsigned int insn, unsigned long va)
 {
-	*rd = -1;
-	*rn = -1;
+	const long imm =
+		uf_sx(((insn >> 5) & 0x7ffffu) << 2 | ((insn >> 29) & 3u), 21);
 
-	/* add/sub (immediate), logical (immediate): Rd, Rn */
-	if ((insn & 0x1f000000u) == 0x11000000u ||
-	    (insn & 0x1f000000u) == 0x12000000u) {
-		*rd = (int)(insn & 0x1fu);
-		*rn = (int)((insn >> 5) & 0x1fu);
-		return 1;
-	}
-	/* add/sub (shifted register), logical (shifted register): Rd, Rn */
-	if ((insn & 0x1f000000u) == 0x0b000000u ||
-	    (insn & 0x1f000000u) == 0x0a000000u) {
-		*rd = (int)(insn & 0x1fu);
-		*rn = (int)((insn >> 5) & 0x1fu);
-		return 1;
-	}
-	/* movz/movk/movn: Rd only */
-	if ((insn & 0x1f800000u) == 0x12800000u) {
-		*rd = (int)(insn & 0x1fu);
-		return 1;
-	}
-	/* ldr/ldrsw (immediate, unsigned offset): Rt, Rn */
-	if ((insn & UF_M_LDR) == UF_LDR_U64 ||
-	    (insn & UF_M_LDR) == UF_LDR_U32 || (insn & UF_M_LDR) == UF_LDRSW) {
-		*rd = (int)(insn & 0x1fu);
-		*rn = (int)((insn >> 5) & 0x1fu);
-		return 1;
-	}
+	return (va & ~0xfffUL) + (unsigned long)(imm * 4096);
+}
+
+static int uf_adrp_encode(unsigned int *out, unsigned int rd,
+			  unsigned long page, unsigned long va)
+{
+	long imm;
+
+	if (uf_displacement(va & ~0xfffUL, page, 12, 21, &imm))
+		return UF_INLINE_ERANGE;
+	*out = UF_ADRP | (((unsigned int)imm & 3u) << 29) |
+	       ((((unsigned int)imm >> 2) & 0x7ffffu) << 5) | rd;
+	return UF_INLINE_OK;
+}
+
+static void uf_mov_imm(unsigned int *out, unsigned int rd, unsigned long value)
+{
+	unsigned int k;
+
+	for (k = 0; k < 4; k++)
+		out[k] = (k ? 0xf2800000u : 0xd2800000u) | (k << 21) |
+			 ((unsigned int)((value >> (16 * k)) & 0xffffu) << 5) |
+			 rd;
+}
+
+/* All immediate branch classes; bit 4 of B.cond is FEAT_HBC's BC.cond. */
+static unsigned int uf_branch_bits(unsigned int insn)
+{
+	if ((insn & 0x7c000000u) == UF_B)
+		return 26;
+	if ((insn & 0xff000000u) == 0x54000000u ||
+	    (insn & 0x7e000000u) == 0x34000000u)
+		return 19;
+	if ((insn & 0x7e000000u) == 0x36000000u)
+		return 14;
 	return 0;
 }
 
-/* The instruction that uses the page an adrp computed. */
-#define UF_PAIR_NONE (-1)
-#define UF_PAIR_ADD 0
-#define UF_PAIR_LOAD 1
-
-static int uf_find_user(const unsigned int *src, unsigned int words,
-			unsigned int i, unsigned int rd, unsigned int *out)
+static unsigned long uf_branch_target(unsigned int insn, unsigned int bits,
+				      unsigned long va)
 {
-	unsigned int j;
+	const unsigned int field = bits == 26 ? insn : insn >> 5;
+	const long offset = uf_sx(field & ((1u << bits) - 1u), bits) * 4;
 
-	for (j = i + 1; j < words && j <= i + UF_LOOKAHEAD; j++) {
-		int d = -1, n = -1;
-
-		if (!uf_reads_writes(src[j], &d, &n))
-			return UF_INLINE_EINSN;
-		if (n == (int)rd) {
-			*out = j;
-			return UF_INLINE_OK;
-		}
-		if (d == (int)rd)
-			return UF_INLINE_EINSN; /* the page is lost before it is used */
-	}
-	return UF_INLINE_EINSN;
+	return va + (unsigned long)offset;
 }
 
-static int uf_pair_kind(unsigned int insn, unsigned int rd)
-{
-	if ((insn & UF_M_ADDSUB) == UF_ADD_IMM ||
-	    (insn & UF_M_ADDSUB) == UF_SUB_IMM) {
-		if ((insn & 0x1fu) == rd && ((insn >> 5) & 0x1fu) == rd)
-			return UF_PAIR_ADD;
-		return UF_PAIR_NONE;
-	}
-	if ((insn & UF_M_LDR) == UF_LDR_U64 ||
-	    (insn & UF_M_LDR) == UF_LDR_U32 || (insn & UF_M_LDR) == UF_LDRSW) {
-		if (((insn >> 5) & 0x1fu) == rd)
-			return UF_PAIR_LOAD;
-		return UF_PAIR_NONE;
-	}
-	return UF_PAIR_NONE;
-}
-
-/* The page an adrp computes, as a value. */
-static unsigned long uf_adrp_value(unsigned int insn, unsigned long insn_va)
-{
-	const unsigned long pc = insn_va & ~0xfffull;
-	const long imm = (long)uf_sx(
-		((insn >> 5) & 0x7ffffu) << 2 | ((insn >> 29) & 0x3u), 21);
-
-	return (unsigned long)((long)pc + imm * 4096);
-}
-
-/* Is this a legal landing pad for an indirect call? */
-static int uf_is_landing(unsigned int insn)
-{
-	if ((insn & ~0xe0u) == 0xd503241fu) /* bti c / j / jc */
-		return 1;
-	if ((insn & ~0xc0u) == 0xd503233fu) /* paciasp / pacibsp */
-		return 1;
-	return 0;
-}
-
-/* Where each source word lands in the copy; -1 when a pair consumed it. */
 struct uf_layout {
-	int out[UF_INSNS];
-	unsigned int words;
+	unsigned short out[UF_INSNS]; /* byte offsets; no consumed instructions */
 	size_t size;
 };
 
 static int uf_plan(const unsigned int *src, unsigned int words,
-		   unsigned long from_va, struct uf_layout *lay)
+		   unsigned long from_va, unsigned long to_va,
+		   struct uf_layout *lay)
 {
 	unsigned int i;
 	size_t at = 0;
 
-	if (words == 0 || words > UF_INSNS)
-		return UF_INLINE_ESIZE;
-	lay->words = words;
-	lay->size = 0;
-	/* 0 means "not placed yet"; a pair marks its user -1 before the loop gets
-	 * there, and the guard below is what keeps that word out of the copy. */
-	for (i = 0; i < UF_INSNS; i++)
-		lay->out[i] = 0;
-
 	for (i = 0; i < words; i++) {
 		const unsigned int insn = src[i];
-		const unsigned long va =
-			from_va + (unsigned long)i * UF_INLINE_INSN;
+		unsigned int encoded;
 
-		if (lay->out[i] == -1)
-			continue; /* consumed by the adrp pair before it */
-		lay->out[i] = (int)(at / UF_INLINE_INSN);
+		lay->out[i] = (unsigned short)at;
+#ifdef UF_INLINE_DEBUG
+		uf_inline_dbg_insn = insn;
+		uf_inline_dbg_index = i;
+		uf_inline_dbg_stage = 1;
+#endif
+		if ((insn & 0x9f000000u) == UF_ADRP) {
+			const unsigned long page =
+				uf_adrp_value(insn, from_va + i * 4UL);
 
-		if ((insn & UF_M_BRANCH) == UF_B ||
-		    (insn & UF_M_BRANCH) == UF_BL) {
-			const long off =
-				(long)uf_sx(insn & 0x03ffffffu, 26) * 4;
-			const unsigned long target =
-				(unsigned long)((long)va + off);
-			const int internal =
-				target >= from_va &&
-				target < from_va + words * UF_INLINE_INSN;
-
-			if (internal)
-				at += UF_INLINE_INSN;
-			else if ((insn & UF_M_BRANCH) == UF_BL)
-				at += 5 *
-				      UF_INLINE_INSN; /* movz/movk up to 4 + blr */
-			else
-				return UF_INLINE_ERANGE;
+			at += uf_adrp_encode(&encoded, insn & 31u, page,
+					     to_va + at) ?
+				      16 :
+				      4;
 			continue;
 		}
-
-		if ((insn & UF_M_COND) == UF_CBZ ||
-		    (insn & UF_M_COND) == UF_CBNZ ||
-		    (insn & UF_M_COND) == UF_TBZ ||
-		    (insn & UF_M_COND) == UF_TBNZ ||
-		    (insn & UF_M_BCOND) == UF_BCOND) {
-			const long off =
-				(insn & UF_M_BCOND) == UF_BCOND ?
-					(long)uf_sx((insn >> 5) & 0x7ffffu,
-						    19) *
-						4 :
-				((insn & UF_M_COND) == UF_TBZ ||
-				 (insn & UF_M_COND) == UF_TBNZ) ?
-					(long)uf_sx((insn >> 5) & 0x3fffu, 14) *
-						4 :
-					(long)uf_sx((insn >> 5) & 0x7ffffu,
-						    19) *
-						4;
-			const unsigned long target =
-				(unsigned long)((long)va + off);
-
-			if (target < from_va ||
-			    target >= from_va + words * UF_INLINE_INSN)
-				return UF_INLINE_ERANGE; /* no absolute form here */
-			at += UF_INLINE_INSN;
-			continue;
-		}
-
-		if ((insn & UF_M_ADRP) == UF_ADRP) {
-			const unsigned int rd = insn & 0x1fu;
-			unsigned int j;
-			int kind;
-
-			if (uf_find_user(src, words, i, rd, &j) != UF_INLINE_OK)
-				return UF_INLINE_EINSN;
-			kind = uf_pair_kind(src[j], rd);
-			if (kind == UF_PAIR_NONE)
-				return UF_INLINE_EINSN;
-
-			/* The user is marked, and the words scheduled in between are left
-			 * to the loop: they get their own slots after this reservation. */
-
-			lay->out[j] = -1;
-			at += (kind == UF_PAIR_LOAD ? 5 : 4) * UF_INLINE_INSN;
-			continue;
-		}
-
-		/* PC-relative with no absolute form here: literal load, prfm
-		 * literal, adr. Refusing is the point. */
-		if ((insn & UF_M_LITERAL) == 0x58000000u ||
-		    (insn & UF_M_LITERAL) == 0x98000000u ||
-		    (insn & UF_M_LITERAL) == 0xd8000000u ||
-		    (insn & UF_M_ADRP) == UF_ADR)
+		/* Entire load-register-literal class: LDR W/X/S/D/Q, LDRSW,
+		 * PRFM, and reserved members. ADR is also refused. These must
+		 * not silently keep a PC-relative operand from the original.
+		 * Exception-generating instructions (BRK/HLT/SVC/etc.) are
+		 * also refused: BUG/exception metadata names original PCs. */
+		if ((insn & 0x3b000000u) == 0x18000000u ||
+		    (insn & 0x9f000000u) == UF_ADR ||
+		    (insn & 0xff000000u) == 0xd4000000u)
 			return UF_INLINE_EINSN;
-
 		at += UF_INLINE_INSN;
 	}
-
 	lay->size = at;
+	return UF_INLINE_OK;
+}
+
+static int uf_branch_encode(unsigned int *out, unsigned int insn,
+			    unsigned int bits, unsigned long va,
+			    unsigned long target)
+{
+	const unsigned int shift = bits == 26 ? 0 : 5;
+	const unsigned int mask = (1u << bits) - 1u;
+	long imm;
+
+	if (uf_displacement(va, target, 2, bits, &imm))
+		return UF_INLINE_ERANGE;
+	*out = (insn & ~(mask << shift)) |
+	       (((unsigned int)imm & mask) << shift);
 	return UF_INLINE_OK;
 }
 
 int uf_inline_entry(void *out, size_t out_size, unsigned long site_va,
 		    unsigned long hook_va)
 {
-	unsigned int *dst = out;
-	const long page_delta =
-		(long)(hook_va & ~0xfffull) - (long)(site_va & ~0xfffull);
-	const long imm21 = page_delta / 4096;
+	unsigned int encoded;
 
-	if (out_size < UF_INLINE_ENTRY)
+	if (!out || out_size < UF_INLINE_ENTRY)
 		return UF_INLINE_ESIZE;
-	if (page_delta % 4096 || imm21 < -(1L << 20) || imm21 >= (1L << 20))
-		return UF_INLINE_ERANGE; /* adrp reaches +-4 GB of pages */
-
-	dst[0] = 0x90000000u | ((unsigned int)(imm21 & 0x3) << 29) |
-		 ((unsigned int)((imm21 >> 2) & 0x7ffffu) << 5) | 17u;
-	dst[1] = 0x91000000u | (((unsigned int)(hook_va & 0xfffu)) << 10) |
-		 (17u << 5) | 17u;
-	dst[2] = 0xd61f0220u; /* br x17 */
-	return (int)UF_INLINE_ENTRY;
+	if (uf_branch_encode(&encoded, UF_B, 26, site_va, hook_va))
+		return UF_INLINE_ERANGE;
+	/* The output buffer is required to have instruction alignment. */
+	if ((unsigned long)out & 3UL)
+		return UF_INLINE_EINSN;
+	*(unsigned int *)out = encoded;
+	return UF_INLINE_ENTRY;
 }
 
 int uf_inline_relocate(void *to, size_t to_size, const void *from,
@@ -320,162 +187,68 @@ int uf_inline_relocate(void *to, size_t to_size, const void *from,
 	struct uf_layout lay;
 	const unsigned int *src = from;
 	unsigned int *dst = to;
-	unsigned int words, i, prefix = 0;
+	unsigned int words, i;
 	int rc;
 
-	(void)to_va;
-	if (len % UF_INLINE_INSN)
-		return UF_INLINE_EINSN;
-	words = (unsigned int)(len / UF_INLINE_INSN);
-	rc = uf_plan(src, words, from_va, &lay);
-	if (rc != UF_INLINE_OK)
-		return rc;
-
-	if (!uf_is_landing(src[0]))
-		prefix = 1;
-	if (lay.size + prefix * UF_INLINE_INSN > to_size ||
-	    lay.size > UF_MAX_OUT)
+	if (out_len)
+		*out_len = 0;
+	if (!to || !from || !len || len > UF_INLINE_MAX_SOURCE)
 		return UF_INLINE_ESIZE;
-	if (prefix) {
-		dst[0] =
-			0xd503245fu; /* bti jc: both a call and a jump can land here */
-		for (i = 0; i < words; i++)
-			if (lay.out[i] >= 0)
-				lay.out[i] += 1;
+	if (((unsigned long)to | (unsigned long)from | from_va | to_va | len) &
+	    3UL)
+		return UF_INLINE_EINSN;
+	if (from_va > ~0UL - len || to_va > ~0UL - UF_INLINE_MAX_COPY)
+		return UF_INLINE_ERANGE;
+	words = (unsigned int)(len / UF_INLINE_INSN);
+	rc = uf_plan(src, words, from_va, to_va, &lay);
+	if (rc)
+		return rc;
+	if (lay.size > to_size)
+		return UF_INLINE_ESIZE;
+
+	/* Validate every branch before writing anything to the destination. In
+	 * particular external calls stay direct: BLR would impose a new BTI
+	 * requirement on a formerly direct-only target and clobber x16/x17. */
+	for (i = 0; i < words; i++) {
+		const unsigned int bits = uf_branch_bits(src[i]);
+		unsigned int encoded;
+		unsigned long target;
+
+		if (!bits)
+			continue;
+		target = uf_branch_target(src[i], bits, from_va + i * 4UL);
+		if (target >= from_va && target - from_va < len)
+			target = to_va + lay.out[(target - from_va) / 4];
+		if (uf_branch_encode(&encoded, src[i], bits, to_va + lay.out[i],
+				     target))
+			return UF_INLINE_ERANGE;
 	}
 
 	for (i = 0; i < words; i++) {
 		const unsigned int insn = src[i];
-		const unsigned long va =
-			from_va + (unsigned long)i * UF_INLINE_INSN;
-		const size_t at = (size_t)lay.out[i] * UF_INLINE_INSN;
+		const unsigned int bits = uf_branch_bits(insn);
+		const unsigned long va = to_va + lay.out[i];
+		unsigned int *at = &dst[lay.out[i] / 4];
 
-		if (lay.out[i] < 0)
-			continue;
-#ifdef UF_INLINE_DEBUG
-		uf_inline_dbg_insn = insn;
-		uf_inline_dbg_index = i;
-		uf_inline_dbg_stage = 2;
-#endif
+		if (bits) {
+			unsigned long target =
+				uf_branch_target(insn, bits, from_va + i * 4UL);
 
-		if ((insn & UF_M_BRANCH) == UF_BL) {
-			const long off =
-				(long)uf_sx(insn & 0x03ffffffu, 26) * 4;
-			const unsigned long target =
-				(unsigned long)((long)va + off);
+			if (target >= from_va && target - from_va < len)
+				target =
+					to_va + lay.out[(target - from_va) / 4];
+			uf_branch_encode(at, insn, bits, va, target);
+		} else if ((insn & 0x9f000000u) == UF_ADRP) {
+			const unsigned long page =
+				uf_adrp_value(insn, from_va + i * 4UL);
 
-			if (target >= from_va &&
-			    target < from_va + (unsigned long)words *
-						       UF_INLINE_INSN) {
-				const size_t to_word =
-					(size_t)lay.out[(target - from_va) /
-							UF_INLINE_INSN];
-				const long new_off =
-					(long)to_word * UF_INLINE_INSN -
-					(long)at;
-
-				if (new_off % 4 || new_off / 4 < -(1 << 25) ||
-				    new_off / 4 >= (1 << 25))
-					return UF_INLINE_ERANGE;
-				dst[at / 4] = UF_BL |
-					      ((new_off / 4) & 0x03ffffffu);
-			} else {
-				unsigned int tmp[4];
-				unsigned int n =
-					uf_mov_imm(tmp, UF_X17, target);
-				unsigned int k;
-
-				for (k = 0; k < n; k++)
-					dst[at / 4 + k] = tmp[k];
-				dst[at / 4 + n] = 0xd63f0220u; /* blr x17 */
-				while (n + 1 < 5)
-					dst[at / 4 + ++n] = 0xd503201fu;
-			}
-			continue;
+			if (uf_adrp_encode(at, insn & 31u, page, va))
+				uf_mov_imm(at, insn & 31u, page);
+		} else {
+			*at = insn;
 		}
-
-		if ((insn & UF_M_COND) == UF_CBZ ||
-		    (insn & UF_M_COND) == UF_CBNZ ||
-		    (insn & UF_M_COND) == UF_TBZ ||
-		    (insn & UF_M_COND) == UF_TBNZ ||
-		    (insn & UF_M_BCOND) == UF_BCOND) {
-			const long off =
-				(insn & UF_M_BCOND) == UF_BCOND ?
-					(long)uf_sx((insn >> 5) & 0x7ffffu,
-						    19) *
-						4 :
-				((insn & UF_M_COND) == UF_TBZ ||
-				 (insn & UF_M_COND) == UF_TBNZ) ?
-					(long)uf_sx((insn >> 5) & 0x3fffu, 14) *
-						4 :
-					(long)uf_sx((insn >> 5) & 0x7ffffu,
-						    19) *
-						4;
-			const unsigned long target =
-				(unsigned long)((long)va + off);
-			const long to_word = (long)lay.out[(target - from_va) /
-							   UF_INLINE_INSN];
-			const long new_off =
-				to_word * UF_INLINE_INSN - (long)at;
-			const unsigned int bits =
-				(insn & UF_M_BCOND) == UF_BCOND ? 19 :
-				((insn & UF_M_COND) == UF_TBZ ||
-				 (insn & UF_M_COND) == UF_TBNZ) ?
-								  14 :
-								  19;
-			const long limit = 1L << (bits - 1);
-
-			if (new_off % 4 || new_off / 4 < -limit ||
-			    new_off / 4 >= limit)
-				return UF_INLINE_ERANGE;
-			dst[at / 4] = (insn & ~(((1u << bits) - 1u) << 5)) |
-				      (((unsigned int)(new_off / 4) &
-					((1u << bits) - 1u))
-				       << 5);
-			continue;
-		}
-
-		if ((insn & UF_M_ADRP) == UF_ADRP) {
-			const unsigned int rd = insn & 0x1fu;
-			unsigned int j, k, n;
-			int kind;
-			unsigned long value = uf_adrp_value(insn, va);
-			unsigned int tmp[4];
-
-			if (uf_find_user(src, words, i, rd, &j) != UF_INLINE_OK)
-				return UF_INLINE_EINSN;
-			kind = uf_pair_kind(src[j], rd);
-			if (kind == UF_PAIR_LOAD) {
-				const unsigned long size =
-					((src[j] >> 30) & 0x1u) ? 8 : 4;
-
-				value += ((src[j] >> 10) & 0xfffu) * size;
-			} else {
-				const unsigned long imm12 = (src[j] >> 10) &
-							    0xfffu;
-				const unsigned long shift =
-					((src[j] >> 22) & 0x1u) ? 12 : 0;
-
-				value = (src[j] & UF_M_ADDSUB) == UF_SUB_IMM ?
-						value - (imm12 << shift) :
-						value + (imm12 << shift);
-			}
-
-			n = uf_mov_imm(tmp, rd, value);
-			for (k = 0; k < n; k++)
-				dst[at / 4 + k] = tmp[k];
-			while (n < 4)
-				dst[at / 4 + n++] =
-					0xd503201fu; /* keep the layout */
-			if (kind == UF_PAIR_LOAD)
-				dst[at / 4 + 4] = src[j] & ~(0xfffu << 10);
-			continue;
-		}
-
-		dst[at / 4] = insn;
 	}
-
 	if (out_len)
-		*out_len = lay.size + prefix * UF_INLINE_INSN;
+		*out_len = lay.size;
 	return UF_INLINE_OK;
 }

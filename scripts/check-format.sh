@@ -27,6 +27,7 @@ fi
 mapfile -t text < <(git ls-files | grep -vE '\.(png|jpg|gif|zip|ko|apk|jar|so)$')
 echo "whitespace: ${#text[@]} files"
 for f in "${text[@]}"; do
+  [ -f "$f" ] || continue # gitlinks name directories, not project text files
   # Kernel sources and Makefile recipes are indented with tabs by their own rules, so the tab
   # check only covers the file types this repository writes itself.
   case "$f" in

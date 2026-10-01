@@ -15,7 +15,8 @@ kmi_from_uname() {
 
   if [ -n "$_branch" ]; then
     # The device names its branch, so only that branch's module will do: one from another branch
-    # has a different vermagic and the kernel would refuse it anyway.
+    # may have different layouts and symbol contracts. A loader-adjustable
+    # release/vermagic string alone does not make two KMIs compatible.
     echo "${_branch}-${_ver}"
     return
   fi
@@ -42,8 +43,9 @@ if [ -n "$SRC" ]; then
   done
   ui_print "- $(uname -r) -> $(basename "$SRC")"
 else
-  # Nothing here can load: the kernel refuses another KMI's vermagic, and the structures this
-  # module reads differ between them. Keep the closest build for anyone who wants to try it.
+  # No matching KMI was packaged. A loader can adjust supported vermagic
+  # differences, but not incompatible kernel layouts. Keep the closest build
+  # for explicit diagnosis without loading it automatically.
   _want_ver="$(uname -r | grep -oE '^[0-9]+\.[0-9]+' | head -n1)"
   for _f in "$MODPATH"/ko/*-"$_want_ver"_arm64_hma_uidfake.ko; do
     [ -e "$_f" ] || continue
@@ -51,8 +53,8 @@ else
     break
   done
   ui_print "! No ko for $(uname -r) (KMI ${KMI:-unknown}). ko/ has: $(ls "$MODPATH/ko" | tr '\n' ' ')"
-  ui_print "! A build for another KMI will not load, and forcing it in can crash or bootloop the"
-  ui_print "! device. Build your own (docs/build.md) and report the device, its KMI and uname -r."
+  ui_print "! This package does not support that KMI. Loader-adjusted vermagic is not a"
+  ui_print "! layout compatibility check. See docs/build.md and report the KMI and uname -r."
   ui_print "! To try the closest build anyway, unsupported and at your own risk:"
   ui_print "!   su -c 'mv $MODPATH/ko/hma_uidfake.ko.try $MODPATH/ko/hma_uidfake.ko && reboot'"
 fi

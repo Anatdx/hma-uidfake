@@ -10,22 +10,24 @@
 #   "Unknown symbol __clear_cache (-2)"
 #
 #   scripts/check-undefined.sh [module.ko ...]
-set -u
+set -euo pipefail
 cd "$(dirname "$0")/.."
-NM=/opt/ddk/clang/clang-r487747c/bin/llvm-nm
+nm_tool=${NM:-llvm-nm}
+ddk=${DDK_ROOT:-/opt/ddk}
+command -v "$nm_tool" >/dev/null || { echo "missing symbol reader: $nm_tool" >&2; exit 1; }
 KOS=("$@")
 [ ${#KOS[@]} -eq 0 ] && KOS=(build/ko/*.ko)
 
 fail=0
 for ko in "${KOS[@]}"; do
   kmi=$(basename "$ko" _arm64_hma_uidfake.ko)
-  symvers=/opt/ddk/kdir/$kmi/Module.symvers
+  symvers="$ddk/kdir/$kmi/Module.symvers"
   if [ ! -f "$symvers" ]; then
     echo "FAIL $kmi: no $symvers"
     fail=1
     continue
   fi
-  syms=$("$NM" -u "$ko" | awk '{print $NF}' | sort -u)
+  syms=$("$nm_tool" -u "$ko" | awk '{print $NF}' | sort -u)
   bad=0
   for s in $syms; do
     if ! awk -v n="$s" '$2 == n { found = 1; exit } END { exit !found }' "$symvers"; then

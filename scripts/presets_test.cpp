@@ -128,7 +128,7 @@ int main()
 	add("com.example.shizuku", utf16("rikka.shizuku.ShizukuProvider"));
 	add("com.example.xposed_legacy", pk + "assets/xposed_init");
 
-	std::set<std::string, std::less<> > wanted{
+	std::set<std::string, std::less<>> wanted{
 		"detector_apps", "root_apps",	       "sus_apps",
 		"custom_rom",	 "accessibility_apps", "shizuku_dhizuku",
 		"xposed"

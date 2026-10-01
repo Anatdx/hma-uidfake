@@ -1,0 +1,4 @@
+# Keep the kernel-style host-test layout, but parse modern C++ test fixtures.
+# Cpp03 treats raw JSON strings as code and can corrupt them when formatting.
+BasedOnStyle: InheritParentConfig
+Standard: Latest

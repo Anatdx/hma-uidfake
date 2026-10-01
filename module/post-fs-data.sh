@@ -1,18 +1,8 @@
 #!/system/bin/sh
-# Load the module before the framework starts: the reads a child does before its window
-# closes have to be covered. lkmloader is the loader: it is shipped here, it needs no root
-# solution to be installed, and it is what resolves the ko's undefined symbols from
-# /proc/kallsyms and, when the kernel names the vermagic it wants, writes that in and
-# retries.
+# Install hooks before the framework starts. Policies and APK paths are sent by
+# Owner's sync-tool from service.sh once their source files are available.
 MODDIR=${0%/*}
-KO="$MODDIR/ko/hma_uidfake.ko"
 LOG="$MODDIR/state/sync.log"
 mkdir -p "$MODDIR/state"
-[ -f "$KO" ] || exit 0
-lsmod | grep -q '^hma_uidfake ' && exit 0
-
-[ -x "$MODDIR/lkmloader" ] || { echo "[load] no lkmloader" >>"$LOG"; exit 0; }
-"$MODDIR/lkmloader" "$KO" >>"$LOG" 2>&1
-_rc=$?
-echo "[load] lkmloader rc=$_rc $(date '+%m-%d %H:%M:%S')" >>"$LOG"
-lsmod | grep -q '^hma_uidfake ' || echo "[load] not loaded; no ko for this kernel? see the customize.sh note" >>"$LOG"
+. "$MODDIR/load.sh"
+uidfake_load "$MODDIR" >>"$LOG" 2>&1

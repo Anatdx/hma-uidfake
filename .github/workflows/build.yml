@@ -18,15 +18,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kmi:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          - android16-6.12
-          - android17-6.18
+        include:
+          - {kmi: android12-5.10, clang: clang-r416183b}
+          - {kmi: android13-5.10, clang: clang-r450784e}
+          - {kmi: android13-5.15, clang: clang-r450784e}
+          - {kmi: android14-5.15, clang: clang-r487747c}
+          - {kmi: android14-6.1, clang: clang-r487747c}
+          - {kmi: android15-6.6, clang: clang-r510928}
+          - {kmi: android16-6.12, clang: clang-r536225}
+          - {kmi: android17-6.18, clang: clang-r584948c}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -38,20 +38,12 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          KDIR="${KDIR:-/opt/ddk/kdir/${{ matrix.kmi }}}"
-          [ -f "$KDIR/Makefile" ] || { echo "no kernel tree at $KDIR"; exit 1; }
-
-          # kbuild writes objects into the M= directory, so build from a stage dir
-          # that only contains symlinks to src/ to keep the checkout clean.
-          stage="$RUNNER_TEMP/stage/${{ matrix.kmi }}"
-          mkdir -p "$stage" out
-          for f in src/*; do ln -sfn "$PWD/$f" "$stage/$(basename "$f")"; done
-
-          # CROSS_COMPILE is what a tree this old takes its target triple from; without it clang
-          # emits bitcode for the host and the LTO link says "incompatible with aarch64elf".
-          make -C "$KDIR" ARCH=arm64 LLVM=1 CROSS_COMPILE=aarch64-linux-gnu- M="$stage" modules
-          llvm-strip -d "$stage/hma_uidfake.ko" || true
-          cp "$stage/hma_uidfake.ko" "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
+          UG_KBUILD_JOBS="$(nproc)" bash scripts/build-kmi.sh \
+            "${{ matrix.kmi }}" "${{ matrix.clang }}" \
+            "$RUNNER_TEMP/stage/${{ matrix.kmi }}" \
+            "out/${{ matrix.kmi }}_arm64_hma_uidfake.ko"
+          NM="/opt/ddk/clang/${{ matrix.clang }}/bin/llvm-nm" \
+            bash scripts/check-undefined.sh out/*.ko
       - uses: actions/upload-artifact@v7
         with:
           name: ko-${{ matrix.kmi }}

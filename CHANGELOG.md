@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- Replace whole-function inline copies with short runtime entry trampolines that return to the
+  native body. Publish one aligned four-byte branch through the kernel's ARM64 patch helper,
+  preserving leading BTI/PAC handling and synchronizing instruction visibility across CPUs.
+  Allocate private nearby execution pages when direct branches cannot reach; seal them RO/X
+  before publication and retain published code until reboot.
+- Apply UID policy before the native lookup, including misses. Hidden targets normally query an
+  absent replacement UID; release and reject a replacement that becomes live. Match `hash_32`
+  arithmetic by truncating multiplication to 32 bits before extracting the bucket. These changes
+  do not establish equal latency with an absent UID.
+- Preserve concurrent unrelated task flags during identity propagation. Skip initial task tagging
+  when neither hook family installs, and retain tier state while published inline hooks remain live.
+- Clear old policy on an initially empty configuration, handle filtered-empty snapshots, and reserve
+  a full empty mask. Remove a diagnostic dentry read after its path reference is released.
+- Reconcile APK updates by inode across partial application and lost replies. Confirm removals before
+  additions, retry uncertain records, accept direct system-APK paths, and refresh rules after committed
+  package/user database changes. Arm watches before the first synchronization attempt.
+- Prefer installed ksud for boot loading, retaining the bundled loader when ksud is absent. Share
+  KMI builds between CMake and CI and support worktree/source-export packaging.
+
 ## 0.4.0
 
 - Every hook mechanism is its own file, and which one is in place is a registry rather than a chain

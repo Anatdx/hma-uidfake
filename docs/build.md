@@ -1,51 +1,95 @@
-# Build and tests
+# Build
 
-Each KMI builds with the compiler its kernel was built with: clang CFI and the shadow call stack
-come from that compiler, so mixing is not an option. kbuild links the module itself and writes its
-objects into its `M=` directory, so each KMI builds in `build/kmi/<kmi>/`, a directory holding only
-symlinks to `src/`.
+Use Linux with CMake 3.22+, GNU make, Python 3, an Android NDK, and the matching
+DDK kernel tree/compiler for each KMI. Install `nlohmann-json3-dev` and `zlib1g-dev`
+for the userspace helper. Initialize the pinned loader before configuring:
 
-The version and `versionCode` in the packed `module.prop` come from the git tag (falling back to the
-values in `module/module.prop` for a tree without git). `-DUG_USE_PREBUILT_KO=ON` packs the modules
-already in `build/ko`, which is how the CI packaging job assembles a zip from separately built KMI
-jobs.
+```sh
+git submodule update --init --recursive
+```
 
-The zip also carries `sync-tool` (built from `src/tools`) and `lkmloader` (built from the
-`external/lkmloader` submodule, an upstream MIT project pinned by `.gitmodules` + gitlink).
-`lkmloader` is what the module's scripts load the ko with: it does not depend on a particular
-root solution, which is why it is bundled.
-Clone with `--recurse-submodules`, or run `git submodule update --init`.
+Each KMI builds with its DDK compiler so that Clang CFI and shadow call stack
+instrumentation match. Kbuild links the module and writes its objects into
+`build/kmi/<KMI>`, a directory holding symlinks to `src/`.
 
-## Tests
+## Package build
 
-- `scripts/run-hosttest.sh` compiles the real `src/policy.c` against the `linux/*` shims in
-  `scripts/hosttest/` and checks every configured `(caller, target)` pair, and the same for the ABX
-  reader against the first bytes of a real `packages.xml`. Real sources, so word sizes, field order
-  and the encoding of a branch written into kernel text are covered.
-- `scripts/branch_encode_test.c` checks the branch encoding on its own, in user space.
-- `scripts/config_paths_test.cpp` builds a tree and checks the rule-source specs: an exact file, an
-  HMA-OSS data directory named with a random suffix, and specs that match nothing yet.
-- `scripts/rules_test.cpp` drives both rule formats with configs instead of a device: HMA's hidden
-  set and built-in list, and HMA-OSS's decision chain with its opposite list and presets.
-- `scripts/lookup_model.py` states what a query touches as a function of `(caller, target)` and the
-  load counts, which the C cannot assert about itself.
-- `scripts/check-undefined.sh` checks every undefined symbol against the DDK's per-KMI
-  `Module.symvers`, the same table kbuild uses; `scripts/test-kmi-map.sh` checks `uname -r` to KMI
-  mapping and that the zip carries the result.
-- `scripts/run-clang-tidy.sh` analyses both halves: the module with the flags kbuild really
-  compiled with, taken from its `.cmd` files, and the userspace helper on its own.
-- `scripts/check-format.sh` covers what neither tool reaches -- the CMake files, the shell scripts,
-  the module template, the workflow -- and runs `clang-format --dry-run` over every source file. The
-  module and the test sources use the kernel's `.clang-format`, `src/tools/` uses LLVM's.
+With all default DDKs under `/opt/ddk`:
+
+```sh
+export ANDROID_NDK_HOME=/absolute/path/to/android-ndk
+cmake -S . -B build -DUG_NDK="$ANDROID_NDK_HOME" -DDDK_ROOT=/opt/ddk
+cmake --build build -j8
+```
+
+The default KMIs are android14-6.1, android15-6.6, android16-6.12 and android17-6.18.
+`-DUG_ENABLE_5X=ON` adds the four legacy 5.x KMIs when their DDK trees are present.
+Modules go to `build/ko`; the installable zip goes to `build/dist`. The package
+also contains `sync-tool`, the pinned `external/lkmloader`, and the boot scripts.
+
+Version metadata comes from git, falling back to `module/module.prop` for source
+exports. `-DUG_VERSION_OVERRIDE=0.4.0-dev+local -DUG_VERSION_CODE_OVERRIDE=4000`
+sets explicit metadata without changing tags or module attribution.
+
+## Separate KMI builds
+
+For environments with one DDK each, CMake and CI share `scripts/build-kmi.sh`:
+
+| KMI | DDK compiler |
+| --- | --- |
+| android14-6.1 | clang-r487747c |
+| android15-6.6 | clang-r510928 |
+| android16-6.12 | clang-r536225 |
+| android17-6.18 | clang-r584948c |
+
+For example, run this inside the 6.1 build environment:
+
+```sh
+UG_KBUILD_JOBS=8 bash scripts/build-kmi.sh \
+  android14-6.1 clang-r487747c \
+  build/kmi/android14-6.1 build/ko/android14-6.1_arm64_hma_uidfake.ko
+```
+
+Collect the desired modules in `build/ko`, then package them with the NDK:
+
+```sh
+cmake -S . -B build -DUG_NDK="$ANDROID_NDK_HOME" -DUG_USE_PREBUILT_KO=ON
+cmake --build build -j8
+```
+
+Prebuilt mode packages the files present in `build/ko`; keep that directory limited
+to the intended candidate. `UG_DEBUG=ON` enables permanent kernel diagnostics.
+Normal packages leave it off; the `debug=1` module parameter enables them for 60 seconds.
+
+## Loading
+
+Install the zip through KernelSU and reboot. `customize.sh` selects the matching
+KMI. `post-fs-data.sh` loads early; `service.sh` retries if needed and starts
+`sync-tool`. Both prefer `/data/adb/ksud insmod` and use the bundled loader only
+when ksud is absent. Logs are in the installed module's `state/sync.log`.
+
+For manual loading from a root shell on a boot without this module active:
+
+```sh
+/data/adb/ksud insmod /data/local/tmp/hma_uidfake.ko 'uid_tier=inline setuid_tier=inline'
+```
+
+Forcing the inline tiers disables fallback for that attempt. Normal package loading
+uses automatic selection; check module status for the installed mechanisms and
+errors. Published inline hooks remain loaded until reboot, so updating package
+files does not replace the running module. A vermagic release-string difference
+alone does not establish incompatibility, but the loader cannot repair incompatible
+KMI structure layouts.
 
 ## uidbench
 
-Not part of the build. Cross-compile and run it as an app uid that hides:
+This optional measurement tool is not a package component. Cross-compile it and
+run as an app uid with hiding rules:
 
-```bash
-$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang \
+```sh
+"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" \
   -O2 -static -o uidbench src/tools/uidbench.c
 ```
 
-It samples the hidden, absent and unhooked cases in the same round and reports paired deltas, t
-statistics and the sample count an attacker would need for a 5 sigma decision.
+It samples hidden, absent and unhooked cases in one round. Compare latency on a
+controlled device workload; functional success alone does not establish a speedup.
